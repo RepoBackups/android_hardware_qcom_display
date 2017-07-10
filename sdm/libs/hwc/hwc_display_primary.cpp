@@ -34,6 +34,10 @@
 #include <stdarg.h>
 #include <sys/mman.h>
 
+#include <map>
+#include <string>
+#include <vector>
+
 #include "hwc_display_primary.h"
 #include "hwc_debugger.h"
 
@@ -42,14 +46,14 @@
 namespace sdm {
 
 int HWCDisplayPrimary::Create(CoreInterface *core_intf, BufferAllocator *buffer_allocator,
-                              hwc_procs_t const **hwc_procs, qService::QService *qservice,
+                              HWCCallbacks *callbacks, qService::QService *qservice,
                               HWCDisplay **hwc_display) {
   int status = 0;
   uint32_t primary_width = 0;
   uint32_t primary_height = 0;
 
-  HWCDisplay *hwc_display_primary = new HWCDisplayPrimary(core_intf, buffer_allocator,
-                                                          hwc_procs, qservice);
+  HWCDisplay *hwc_display_primary =
+      new HWCDisplayPrimary(core_intf, buffer_allocator, callbacks, qservice);
   status = hwc_display_primary->Init();
   if (status) {
     delete hwc_display_primary;
@@ -81,16 +85,20 @@ void HWCDisplayPrimary::Destroy(HWCDisplay *hwc_display) {
   delete hwc_display;
 }
 
-HWCDisplayPrimary::HWCDisplayPrimary(CoreInterface *core_intf,
-                                     BufferAllocator *buffer_allocator,
-                                     hwc_procs_t const **hwc_procs,
-                                     qService::QService *qservice)
-  : HWCDisplay(core_intf, hwc_procs, kPrimary, HWC_DISPLAY_PRIMARY, true, qservice,
-               DISPLAY_CLASS_PRIMARY), buffer_allocator_(buffer_allocator) {
+HWCDisplayPrimary::HWCDisplayPrimary(CoreInterface *core_intf, BufferAllocator *buffer_allocator,
+                                     HWCCallbacks *callbacks, qService::QService *qservice)
+    : HWCDisplay(core_intf, callbacks, kPrimary, HWC_DISPLAY_PRIMARY, true, qservice,
+                 DISPLAY_CLASS_PRIMARY),
+      buffer_allocator_(buffer_allocator),
+      cpu_hint_(NULL) {
 }
 
 int HWCDisplayPrimary::Init() {
-  cpu_hint_.Init(static_cast<HWCDebugHandler*>(HWCDebugHandler::Get()));
+  cpu_hint_ = new CPUHint();
+  if (cpu_hint_->Init(static_cast<HWCDebugHandler *>(HWCDebugHandler::Get())) != kErrorNone) {
+    delete cpu_hint_;
+    cpu_hint_ = NULL;
+  }
 
   use_metadata_refresh_rate_ = true;
   int disable_metadata_dynfps = 0;
@@ -99,11 +107,18 @@ int HWCDisplayPrimary::Init() {
     use_metadata_refresh_rate_ = false;
   }
 
-  return HWCDisplay::Init();
+  int status = HWCDisplay::Init();
+  if (status) {
+    return status;
+  }
+  color_mode_ = new HWCColorMode(display_intf_);
+
+  return INT(color_mode_->Init());
 }
 
-void HWCDisplayPrimary::ProcessBootAnimCompleted(hwc_display_contents_1_t *list) {
+void HWCDisplayPrimary::ProcessBootAnimCompleted() {
   uint32_t numBootUpLayers = 0;
+  // TODO(user): Remove this hack
 
   numBootUpLayers = static_cast<uint32_t>(Debug::GetBootAnimLayerCount());
 
@@ -114,20 +129,24 @@ void HWCDisplayPrimary::ProcessBootAnimCompleted(hwc_display_contents_1_t *list)
   * HWC_GEOMETRY_CHANGED fail in correctly identifying the
   * exact bootup transition to homescreen
   */
-  char cryptoState[PROPERTY_VALUE_MAX];
-  char voldDecryptState[PROPERTY_VALUE_MAX];
+  char property[PROPERTY_VALUE_MAX];
   bool isEncrypted = false;
   bool main_class_services_started = false;
-  if (property_get("ro.crypto.state", cryptoState, "unencrypted")) {
-    if (!strcmp(cryptoState, "encrypted")) {
+  property_get("ro.crypto.state", property, "unencrypted");
+  if (!strcmp(property, "encrypted")) {
+    property_get("ro.crypto.type", property, "block");
+    if (!strcmp(property, "block")) {
       isEncrypted = true;
-      if (property_get("vold.decrypt", voldDecryptState, "") &&
-            !strcmp(voldDecryptState, "trigger_restart_framework"))
+      property_get("vold.decrypt", property, "");
+      if (!strcmp(property, "trigger_restart_framework")) {
         main_class_services_started = true;
+      }
     }
   }
-  if ((!isEncrypted ||(isEncrypted && main_class_services_started)) &&
-    (list->numHwLayers > numBootUpLayers)) {
+
+  if ((!isEncrypted || (isEncrypted && main_class_services_started)) &&
+      (layer_set_.size() > numBootUpLayers)) {
+    DLOGI("Applying default mode");
     boot_animation_completed_ = true;
     // Applying default mode after bootanimation is finished And
     // If Data is Encrypted, it is ready for access.
@@ -136,27 +155,24 @@ void HWCDisplayPrimary::ProcessBootAnimCompleted(hwc_display_contents_1_t *list)
   }
 }
 
-int HWCDisplayPrimary::Prepare(hwc_display_contents_1_t *content_list) {
-  int status = 0;
+HWC2::Error HWCDisplayPrimary::Validate(uint32_t *out_num_types, uint32_t *out_num_requests) {
+  auto status = HWC2::Error::None;
   DisplayError error = kErrorNone;
 
-  if (!boot_animation_completed_)
-    ProcessBootAnimCompleted(content_list);
-
   if (display_paused_) {
-    MarkLayersForGPUBypass(content_list);
+    MarkLayersForGPUBypass();
     return status;
   }
 
-  status = AllocateLayerStack(content_list);
-  if (status) {
-    return status;
+  if (color_tranform_failed_) {
+    // Must fall back to client composition
+    MarkLayersForClientComposition();
   }
 
-  status = PrePrepareLayerStack(content_list);
-  if (status) {
-    return status;
-  }
+  // Fill in the remaining blanks in the layers and add them to the SDM layerstack
+  BuildLayerStack();
+  // Checks and replaces layer stack for solid fill
+  SolidFillPrepare();
 
   bool pending_output_dump = dump_frame_count_ && dump_output_to_file_;
 
@@ -167,12 +183,8 @@ int HWCDisplayPrimary::Prepare(hwc_display_contents_1_t *content_list) {
     layer_stack_.flags.post_processed_output = post_processed_output_;
   }
 
-  uint32_t num_updating_layers = GetUpdatingLayersCount(UINT32(content_list->numHwLayers - 1));
-  bool one_updating_layer = (num_updating_layers == 1);
-
-  if (num_updating_layers != 0) {
-    ToggleCPUHint(one_updating_layer);
-  }
+  bool one_updating_layer = SingleLayerUpdating();
+  ToggleCPUHint(one_updating_layer);
 
   uint32_t refresh_rate = GetOptimalRefreshRate(one_updating_layer);
   if (current_refresh_rate_ != refresh_rate) {
@@ -188,91 +200,117 @@ int HWCDisplayPrimary::Prepare(hwc_display_contents_1_t *content_list) {
     handle_idle_timeout_ = false;
   }
 
-  if (content_list->numHwLayers <= 1) {
-    DisplayConfigFixedInfo display_config;
-    display_intf_->GetConfig(&display_config);
-    if (display_config.is_cmdmode) {
-      DLOGI("Skipping null commit on cmd mode panel");
-    } else {
-      flush_ = true;
-    }
-    return 0;
-  }
-
-  status = PrepareLayerStack(content_list);
-  if (status) {
+  if (layer_set_.empty()) {
+    flush_ = true;
     return status;
   }
 
-  return 0;
+  status = PrepareLayerStack(out_num_types, out_num_requests);
+  return status;
 }
 
-int HWCDisplayPrimary::Commit(hwc_display_contents_1_t *content_list) {
-  int status = 0;
-
-  DisplayConfigFixedInfo display_config;
-  display_intf_->GetConfig(&display_config);
-  if (content_list->numHwLayers <= 1 && display_config.is_cmdmode) {
-    DLOGI("Skipping null commit on cmd mode panel");
-    return 0;
-  }
-
+HWC2::Error HWCDisplayPrimary::Present(int32_t *out_retire_fence) {
+  auto status = HWC2::Error::None;
   if (display_paused_) {
-    if (content_list->outbufAcquireFenceFd >= 0) {
-      // If we do not handle the frame set retireFenceFd to outbufAcquireFenceFd,
-      // which will make sure the framework waits on it and closes it.
-      content_list->retireFenceFd = dup(content_list->outbufAcquireFenceFd);
-      close(content_list->outbufAcquireFenceFd);
-      content_list->outbufAcquireFenceFd = -1;
-    }
-
+    // TODO(user): From old HWC implementation
+    // If we do not handle the frame set retireFenceFd to outbufAcquireFenceFd
+    // Revisit this when validating display_paused
     DisplayError error = display_intf_->Flush();
     if (error != kErrorNone) {
       DLOGE("Flush failed. Error = %d", error);
     }
+  } else {
+    status = HWCDisplay::CommitLayerStack();
+    if (status == HWC2::Error::None) {
+      HandleFrameOutput();
+      SolidFillCommit();
+      status = HWCDisplay::PostCommitLayerStack(out_retire_fence);
+    }
+  }
+
+  CloseAcquireFds();
+  return status;
+}
+
+HWC2::Error HWCDisplayPrimary::GetColorModes(uint32_t *out_num_modes,
+                                             android_color_mode_t *out_modes) {
+  if (out_modes == nullptr) {
+    *out_num_modes = color_mode_->GetColorModeCount();
+  } else {
+    color_mode_->GetColorModes(out_num_modes, out_modes);
+  }
+
+  return HWC2::Error::None;
+}
+
+HWC2::Error HWCDisplayPrimary::SetColorMode(android_color_mode_t mode) {
+  auto status = color_mode_->SetColorMode(mode);
+  if (status != HWC2::Error::None) {
+    DLOGE("failed for mode = %d", mode);
     return status;
   }
 
-  status = HWCDisplay::CommitLayerStack(content_list);
-  if (status) {
+  callbacks_->Refresh(HWC_DISPLAY_PRIMARY);
+
+  return status;
+}
+
+HWC2::Error HWCDisplayPrimary::SetColorTransform(const float *matrix,
+                                                 android_color_transform_t hint) {
+  if (!matrix) {
+    return HWC2::Error::BadParameter;
+  }
+
+  auto status = color_mode_->SetColorTransform(matrix, hint);
+  if (status != HWC2::Error::None) {
+    DLOGE("failed for hint = %d", hint);
+    color_tranform_failed_ = true;
     return status;
   }
 
-  HandleFrameOutput();
+  callbacks_->Refresh(HWC_DISPLAY_PRIMARY);
+  color_tranform_failed_ = false;
 
-  status = HWCDisplay::PostCommitLayerStack(content_list);
-  if (status) {
-    return status;
-  }
-
-  return 0;
+  return status;
 }
 
 int HWCDisplayPrimary::Perform(uint32_t operation, ...) {
   va_list args;
   va_start(args, operation);
-  int val = va_arg(args, int32_t);
-  va_end(args);
+  int val = 0;
+  LayerRect *rect = NULL;
+
   switch (operation) {
     case SET_METADATA_DYN_REFRESH_RATE:
+      val = va_arg(args, int32_t);
       SetMetaDataRefreshRateFlag(val);
       break;
     case SET_BINDER_DYN_REFRESH_RATE:
+      val = va_arg(args, int32_t);
       ForceRefreshRate(UINT32(val));
       break;
     case SET_DISPLAY_MODE:
+      val = va_arg(args, int32_t);
       SetDisplayMode(UINT32(val));
       break;
     case SET_QDCM_SOLID_FILL_INFO:
+      val = va_arg(args, int32_t);
       SetQDCMSolidFillInfo(true, UINT32(val));
       break;
     case UNSET_QDCM_SOLID_FILL_INFO:
+      val = va_arg(args, int32_t);
       SetQDCMSolidFillInfo(false, UINT32(val));
+      break;
+    case SET_QDCM_SOLID_FILL_RECT:
+      rect = va_arg(args, LayerRect*);
+      solid_fill_rect_ = *rect;
       break;
     default:
       DLOGW("Invalid operation %d", operation);
+      va_end(args);
       return -EINVAL;
   }
+  va_end(args);
 
   return 0;
 }
@@ -299,57 +337,42 @@ void HWCDisplayPrimary::SetMetaDataRefreshRateFlag(bool enable) {
 
 void HWCDisplayPrimary::SetQDCMSolidFillInfo(bool enable, uint32_t color) {
   solid_fill_enable_ = enable;
-  solid_fill_color_  = color;
+  solid_fill_color_ = color;
 }
 
 void HWCDisplayPrimary::ToggleCPUHint(bool set) {
+  if (!cpu_hint_) {
+    return;
+  }
+
   if (set) {
-    cpu_hint_.Set();
+    cpu_hint_->Set();
   } else {
-    cpu_hint_.Reset();
+    cpu_hint_->Reset();
   }
 }
 
-void HWCDisplayPrimary::SetSecureDisplay(bool secure_display_active, bool force_flush) {
+void HWCDisplayPrimary::SetSecureDisplay(bool secure_display_active) {
   if (secure_display_active_ != secure_display_active) {
     // Skip Prepare and call Flush for null commit
     DLOGI("SecureDisplay state changed from %d to %d Needs Flush!!", secure_display_active_,
-           secure_display_active);
+          secure_display_active);
     secure_display_active_ = secure_display_active;
-    skip_prepare_cnt = 1;
-
-    // Issue two null commits for command mode panels when external displays are connected.
-    // Two null commits are required to handle non secure to secure transitions at 30fps.
-    // TODO(user): Need two null commits on video mode also to handle transition cases of
-    // primary at higher fps (ex60) and external at lower fps.
-
-    // Avoid flush for command mode panels when no external displays are connected.
-    // This is to avoid flicker/blink on primary during transitions.
-    DisplayConfigFixedInfo display_config;
-    display_intf_->GetConfig(&display_config);
-    if (display_config.is_cmdmode) {
-      if (force_flush) {
-        DLOGI("Issue two null commits for command mode panels");
-        skip_prepare_cnt = 2;
-      } else {
-        DLOGI("Avoid flush for command mode panel when no external displays are connected");
-        skip_prepare_cnt = 0;
-      }
-    }
+    skip_prepare_ = true;
   }
+  return;
 }
 
 void HWCDisplayPrimary::ForceRefreshRate(uint32_t refresh_rate) {
   if ((refresh_rate && (refresh_rate < min_refresh_rate_ || refresh_rate > max_refresh_rate_)) ||
-       force_refresh_rate_ == refresh_rate) {
+      force_refresh_rate_ == refresh_rate) {
     // Cannot honor force refresh rate, as its beyond the range or new request is same
     return;
   }
 
-  const hwc_procs_t *hwc_procs = *hwc_procs_;
   force_refresh_rate_ = refresh_rate;
 
-  hwc_procs->invalidate(hwc_procs);
+  callbacks_->Refresh(HWC_DISPLAY_PRIMARY);
 
   return;
 }
@@ -367,14 +390,9 @@ uint32_t HWCDisplayPrimary::GetOptimalRefreshRate(bool one_updating_layer) {
 }
 
 DisplayError HWCDisplayPrimary::Refresh() {
-  const hwc_procs_t *hwc_procs = *hwc_procs_;
   DisplayError error = kErrorNone;
 
-  if (!hwc_procs) {
-    return kErrorParameters;
-  }
-
-  hwc_procs->invalidate(hwc_procs);
+  callbacks_->Refresh(HWC_DISPLAY_PRIMARY);
   handle_idle_timeout_ = true;
 
   return error;
@@ -384,7 +402,7 @@ void HWCDisplayPrimary::SetIdleTimeoutMs(uint32_t timeout_ms) {
   display_intf_->SetIdleTimeoutMs(timeout_ms);
 }
 
-static void SetLayerBuffer(const BufferInfo& output_buffer_info, LayerBuffer *output_buffer) {
+static void SetLayerBuffer(const BufferInfo &output_buffer_info, LayerBuffer *output_buffer) {
   output_buffer->width = output_buffer_info.buffer_config.width;
   output_buffer->height = output_buffer_info.buffer_config.height;
   output_buffer->format = output_buffer_info.buffer_config.format;
@@ -418,7 +436,7 @@ void HWCDisplayPrimary::HandleFrameDump() {
     ::close(output_buffer_.release_fence_fd);
     output_buffer_.release_fence_fd = -1;
     if (ret < 0) {
-      DLOGE("sync_wait error errno = %d, desc = %s", errno,  strerror(errno));
+      DLOGE("sync_wait error errno = %d, desc = %s", errno, strerror(errno));
     } else {
       DumpOutputBuffer(output_buffer_info_, output_buffer_base_, layer_stack_.retire_fence_fd);
     }
@@ -463,8 +481,7 @@ void HWCDisplayPrimary::SetFrameDumpConfig(uint32_t count, uint32_t bit_mask_lay
     return;
   }
 
-  void *buffer = mmap(NULL, output_buffer_info_.alloc_buffer_info.size,
-                      PROT_READ | PROT_WRITE,
+  void *buffer = mmap(NULL, output_buffer_info_.alloc_buffer_info.size, PROT_READ | PROT_WRITE,
                       MAP_SHARED, output_buffer_info_.alloc_buffer_info.fd, 0);
 
   if (buffer == MAP_FAILED) {
@@ -479,7 +496,7 @@ void HWCDisplayPrimary::SetFrameDumpConfig(uint32_t count, uint32_t bit_mask_lay
   DisablePartialUpdateOneFrame();
 }
 
-int HWCDisplayPrimary::FrameCaptureAsync(const BufferInfo& output_buffer_info,
+int HWCDisplayPrimary::FrameCaptureAsync(const BufferInfo &output_buffer_info,
                                          bool post_processed_output) {
   // Note: This function is called in context of a binder thread and a lock is already held
   if (output_buffer_info.alloc_buffer_info.fd < 0) {
@@ -495,12 +512,12 @@ int HWCDisplayPrimary::FrameCaptureAsync(const BufferInfo& output_buffer_info,
   GetPanelResolution(&panel_width, &panel_height);
   GetFrameBufferResolution(&fb_width, &fb_height);
 
-  if (post_processed_output && (output_buffer_info.buffer_config.width < panel_width ||
-                                output_buffer_info.buffer_config.height < panel_height)) {
+  if (post_processed_output && (output_buffer_info_.buffer_config.width < panel_width ||
+                                output_buffer_info_.buffer_config.height < panel_height)) {
     DLOGE("Buffer dimensions should not be less than panel resolution");
     return -1;
-  } else if (!post_processed_output && (output_buffer_info.buffer_config.width < fb_width ||
-                                        output_buffer_info.buffer_config.height < fb_height)) {
+  } else if (!post_processed_output && (output_buffer_info_.buffer_config.width < fb_width ||
+                                        output_buffer_info_.buffer_config.height < fb_height)) {
     DLOGE("Buffer dimensions should not be less than FB resolution");
     return -1;
   }
@@ -535,6 +552,7 @@ DisplayError HWCDisplayPrimary::DisablePartialUpdateOneFrame() {
   return error;
 }
 
+
 DisplayError HWCDisplayPrimary::SetMixerResolution(uint32_t width, uint32_t height) {
   return display_intf_->SetMixerResolution(width, height);
 }
@@ -544,4 +562,3 @@ DisplayError HWCDisplayPrimary::GetMixerResolution(uint32_t *width, uint32_t *he
 }
 
 }  // namespace sdm
-

@@ -1,31 +1,21 @@
 /*
-* Copyright (c) 2014 - 2016, The Linux Foundation. All rights reserved.
-*
-* Redistribution and use in source and binary forms, with or without
-* modification, are permitted provided that the following conditions are
-* met:
-*     * Redistributions of source code must retain the above copyright
-*       notice, this list of conditions and the following disclaimer.
-*     * Redistributions in binary form must reproduce the above
-*       copyright notice, this list of conditions and the following
-*       disclaimer in the documentation and/or other materials provided
-*       with the distribution.
-*     * Neither the name of The Linux Foundation nor the names of its
-*       contributors may be used to endorse or promote products derived
-*       from this software without specific prior written permission.
-*
-* THIS SOFTWARE IS PROVIDED "AS IS" AND ANY EXPRESS OR IMPLIED
-* WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF
-* MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NON-INFRINGEMENT
-* ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS
-* BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
-* CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
-* SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR
-* BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY,
-* WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE
-* OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN
-* IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-*/
+ * Copyright (c) 2014-2017, The Linux Foundation. All rights reserved.
+ * Not a Contribution.
+ *
+ * Copyright 2015 The Android Open Source Project
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 
 #include <core/dump_interface.h>
 #include <core/buffer_allocator.h>
@@ -45,13 +35,13 @@
 #include <utils/debug.h>
 #include <sync/sync.h>
 #include <profiler.h>
+#include <string>
 #include <bitset>
 
 #include "hwc_buffer_allocator.h"
 #include "hwc_buffer_sync_handler.h"
 #include "hwc_session.h"
 #include "hwc_debugger.h"
-#include "hwc_display_null.h"
 #include "hwc_display_primary.h"
 #include "hwc_display_virtual.h"
 
@@ -65,7 +55,7 @@ static sdm::HWCSession::HWCModuleMethods g_hwc_module_methods;
 hwc_module_t HAL_MODULE_INFO_SYM = {
   .common = {
     .tag = HARDWARE_MODULE_TAG,
-    .version_major = 2,
+    .version_major = 3,
     .version_minor = 0,
     .id = HWC_HARDWARE_MODULE_ID,
     .name = "QTI Hardware Composer Module",
@@ -77,40 +67,15 @@ hwc_module_t HAL_MODULE_INFO_SYM = {
 };
 
 namespace sdm {
-
 Locker HWCSession::locker_;
 
-static void Invalidate(const struct hwc_procs *procs) {
-}
-
-static void VSync(const struct hwc_procs* procs, int disp, int64_t timestamp) {
-}
-
-static void Hotplug(const struct hwc_procs* procs, int disp, int connected) {
-}
-
 HWCSession::HWCSession(const hw_module_t *module) {
-  // By default, drop any events. Calls will be routed to SurfaceFlinger after registerProcs.
-  hwc_procs_default_.invalidate = Invalidate;
-  hwc_procs_default_.vsync = VSync;
-  hwc_procs_default_.hotplug = Hotplug;
-
-  hwc_composer_device_1_t::common.tag = HARDWARE_DEVICE_TAG;
-  hwc_composer_device_1_t::common.version = HWC_DEVICE_API_VERSION_1_5;
-  hwc_composer_device_1_t::common.module = const_cast<hw_module_t*>(module);
-  hwc_composer_device_1_t::common.close = Close;
-  hwc_composer_device_1_t::prepare = Prepare;
-  hwc_composer_device_1_t::set = Set;
-  hwc_composer_device_1_t::eventControl = EventControl;
-  hwc_composer_device_1_t::setPowerMode = SetPowerMode;
-  hwc_composer_device_1_t::query = Query;
-  hwc_composer_device_1_t::registerProcs = RegisterProcs;
-  hwc_composer_device_1_t::dump = Dump;
-  hwc_composer_device_1_t::getDisplayConfigs = GetDisplayConfigs;
-  hwc_composer_device_1_t::getDisplayAttributes = GetDisplayAttributes;
-  hwc_composer_device_1_t::getActiveConfig = GetActiveConfig;
-  hwc_composer_device_1_t::setActiveConfig = SetActiveConfig;
-  hwc_composer_device_1_t::setCursorPositionAsync = SetCursorPositionAsync;
+  hwc2_device_t::common.tag = HARDWARE_DEVICE_TAG;
+  hwc2_device_t::common.version = HWC_DEVICE_API_VERSION_2_0;
+  hwc2_device_t::common.module = const_cast<hw_module_t *>(module);
+  hwc2_device_t::common.close = Close;
+  hwc2_device_t::getCapabilities = GetCapabilities;
+  hwc2_device_t::getFunction = GetFunction;
 }
 
 int HWCSession::Init() {
@@ -120,11 +85,11 @@ int HWCSession::Init() {
   // Start QService and connect to it.
   qService::QService::init();
   android::sp<qService::IQService> iqservice = android::interface_cast<qService::IQService>(
-                android::defaultServiceManager()->getService(android::String16(qservice_name)));
+      android::defaultServiceManager()->getService(android::String16(qservice_name)));
 
   if (iqservice.get()) {
     iqservice->connect(android::sp<qClient::IQClient>(this));
-    qservice_ = reinterpret_cast<qService::QService* >(iqservice.get());
+    qservice_ = reinterpret_cast<qService::QService *>(iqservice.get());
   } else {
     DLOGE("Failed to acquire %s", qservice_name);
     return -EINVAL;
@@ -138,32 +103,18 @@ int HWCSession::Init() {
   }
 
   // Read which display is first, and create it and store it in primary slot
+  // TODO(user): This will need to be redone for HWC2 - right now we validate only
+  // the primary physical path
   HWDisplayInterfaceInfo hw_disp_info;
   error = core_intf_->GetFirstDisplayInterfaceType(&hw_disp_info);
-  if (error == kErrorNone) {
-    if (hw_disp_info.type == kHDMI) {
-      // HDMI is primary display. If already connected, then create it and store in
-      // primary display slot. If not connected, create a NULL display for now.
-      HWCDebugHandler::Get()->SetProperty("persist.sys.is_hdmi_primary", "1");
-      is_hdmi_primary_ = true;
-      if (hw_disp_info.is_connected) {
-        status = HWCDisplayExternal::Create(core_intf_, &hwc_procs_, qservice_,
-                                            &hwc_display_[HWC_DISPLAY_PRIMARY]);
-        is_hdmi_yuv_ = IsDisplayYUV(HWC_DISPLAY_PRIMARY);
-      } else {
-        // NullDisplay simply closes all its fences, and advertizes a standard
-        // resolution to SurfaceFlinger
-        status = HWCDisplayNull::Create(core_intf_, &hwc_procs_,
+  if (error == kErrorNone && hw_disp_info.type == kHDMI && hw_disp_info.is_connected) {
+    // HDMI is primary display. If already connected, then create it and store in
+    // primary display slot. If not connected, create a NULL display for now.
+    status = HWCDisplayExternal::Create(core_intf_, &callbacks_, qservice_,
                                         &hwc_display_[HWC_DISPLAY_PRIMARY]);
-      }
-    } else {
-      // Create and power on primary display
-      status = HWCDisplayPrimary::Create(core_intf_, &buffer_allocator_, &hwc_procs_, qservice_,
-                                         &hwc_display_[HWC_DISPLAY_PRIMARY]);
-    }
   } else {
     // Create and power on primary display
-    status = HWCDisplayPrimary::Create(core_intf_, &buffer_allocator_, &hwc_procs_, qservice_,
+    status = HWCDisplayPrimary::Create(core_intf_, &buffer_allocator_, &callbacks_, qservice_,
                                        &hwc_display_[HWC_DISPLAY_PRIMARY]);
   }
 
@@ -185,13 +136,12 @@ int HWCSession::Init() {
     return -errno;
   }
 
-  connected_displays_[HWC_DISPLAY_PRIMARY] = 1;
   struct rlimit fd_limit = {};
   getrlimit(RLIMIT_NOFILE, &fd_limit);
   fd_limit.rlim_cur = fd_limit.rlim_cur * 2;
   auto err = setrlimit(RLIMIT_NOFILE, &fd_limit);
   if (err) {
-    DLOGW("Unable to increase fd limit -  err: %d, %s", errno, strerror(errno));
+    DLOGW("Unable to increase fd limit -  err:%d, %s", errno, strerror(errno));
   }
   return 0;
 }
@@ -210,7 +160,6 @@ int HWCSession::Deinit() {
     DLOGE("Display core de-initialization failed. Error = %d", error);
   }
 
-  connected_displays_[HWC_DISPLAY_PRIMARY] = 0;
   return 0;
 }
 
@@ -234,7 +183,7 @@ int HWCSession::Open(const hw_module_t *module, const char *name, hw_device_t **
       return status;
     }
 
-    hwc_composer_device_1_t *composer_device = hwc_session;
+    hwc2_device_t *composer_device = hwc_session;
     *device = reinterpret_cast<hw_device_t *>(composer_device);
   }
 
@@ -248,7 +197,7 @@ int HWCSession::Close(hw_device_t *device) {
     return -EINVAL;
   }
 
-  hwc_composer_device_1_t *composer_device = reinterpret_cast<hwc_composer_device_1_t *>(device);
+  hwc2_device_t *composer_device = reinterpret_cast<hwc2_device_t *>(device);
   HWCSession *hwc_session = static_cast<HWCSession *>(composer_device);
 
   hwc_session->Deinit();
@@ -257,385 +206,503 @@ int HWCSession::Close(hw_device_t *device) {
   return 0;
 }
 
-int HWCSession::Prepare(hwc_composer_device_1 *device, size_t num_displays,
-                        hwc_display_contents_1_t **displays) {
-  DTRACE_SCOPED();
+void HWCSession::GetCapabilities(struct hwc2_device *device, uint32_t *outCount,
+                                 int32_t *outCapabilities) {
+  if (outCapabilities != nullptr && *outCount >= 1) {
+    outCapabilities[0] = HWC2_CAPABILITY_SKIP_CLIENT_COLOR_TRANSFORM;
+  }
+  *outCount = 1;
+}
 
-  if (!device || !displays || num_displays > HWC_NUM_DISPLAY_TYPES) {
-    return -EINVAL;
+template <typename PFN, typename T>
+static hwc2_function_pointer_t AsFP(T function) {
+  static_assert(std::is_same<PFN, T>::value, "Incompatible function pointer");
+  return reinterpret_cast<hwc2_function_pointer_t>(function);
+}
+
+// HWC2 functions returned in GetFunction
+// Defined in the same order as in the HWC2 header
+
+static int32_t AcceptDisplayChanges(hwc2_device_t *device, hwc2_display_t display) {
+  return HWCSession::CallDisplayFunction(device, display, &HWCDisplay::AcceptDisplayChanges);
+}
+
+int32_t HWCSession::CreateLayer(hwc2_device_t *device, hwc2_display_t display,
+                                hwc2_layer_t *out_layer_id) {
+  SCOPE_LOCK(locker_);
+  return CallDisplayFunction(device, display, &HWCDisplay::CreateLayer, out_layer_id);
+}
+
+int32_t HWCSession::CreateVirtualDisplay(hwc2_device_t *device, uint32_t width, uint32_t height,
+                                         int32_t *format, hwc2_display_t *out_display_id) {
+  // TODO(user): Handle concurrency with HDMI
+  SCOPE_LOCK(locker_);
+  if (!device) {
+    return HWC2_ERROR_BAD_DISPLAY;
   }
 
   HWCSession *hwc_session = static_cast<HWCSession *>(device);
-  hwc_procs_t const *hwc_procs = NULL;
-  bool hotplug_connect = false;
-
-  // Hold mutex only in this scope.
-  {
-    SEQUENCE_ENTRY_SCOPE_LOCK(locker_);
-
-    hwc_procs = hwc_session->hwc_procs_;
-
-    if (hwc_session->reset_panel_) {
-      DLOGW("panel is in bad state, resetting the panel");
-      hwc_session->ResetPanel();
-    }
-
-    if (hwc_session->need_invalidate_) {
-      hwc_procs->invalidate(hwc_procs);
-      hwc_session->need_invalidate_ = false;
-    }
-
-    hwc_session->HandleSecureDisplaySession(displays);
-
-    if (hwc_session->color_mgr_) {
-      HWCDisplay *primary_display = hwc_session->hwc_display_[HWC_DISPLAY_PRIMARY];
-      if (primary_display && !hwc_session->is_hdmi_primary_) {
-        int ret = hwc_session->color_mgr_->SolidFillLayersPrepare(displays, primary_display);
-        if (ret)
-          return 0;
-      }
-    }
-
-    for (ssize_t dpy = static_cast<ssize_t>(num_displays - 1); dpy >= 0; dpy--) {
-      hwc_display_contents_1_t *content_list = displays[dpy];
-      // If external display is connected, ignore virtual display content list.
-      // If virtual display content list is valid, connect virtual display if not connected.
-      // If virtual display content list is invalid, disconnect virtual display if connected.
-      // If external display connection is pending, connect external display when virtual
-      // display is destroyed.
-      // If HDMI is primary and the output format is YUV then ignore the virtual display
-      // content list.
-      if (dpy == HWC_DISPLAY_VIRTUAL) {
-        if (hwc_session->hwc_display_[HWC_DISPLAY_EXTERNAL] ||
-                (hwc_session->is_hdmi_primary_ && hwc_session->is_hdmi_yuv_)) {
-          continue;
-        }
-
-        bool valid_content = HWCDisplayVirtual::IsValidContentList(content_list);
-        bool connected = (hwc_session->hwc_display_[HWC_DISPLAY_VIRTUAL] != NULL);
-
-        if (valid_content && !connected) {
-          hwc_session->ConnectDisplay(HWC_DISPLAY_VIRTUAL, content_list);
-        } else if (!valid_content && connected) {
-          hwc_session->DisconnectDisplay(HWC_DISPLAY_VIRTUAL);
-
-          if (hwc_session->external_pending_connect_) {
-            DLOGI("Process pending external display connection");
-            hwc_session->ConnectDisplay(HWC_DISPLAY_EXTERNAL, NULL);
-            hwc_session->external_pending_connect_ = false;
-            hotplug_connect = true;
-          }
-        }
-      }
-
-      if (hwc_session->hwc_display_[dpy]) {
-        if (!content_list) {
-          DLOGI("Display[%d] connected. content_list is null", dpy);
-        } else if (!content_list->numHwLayers) {
-          DLOGE("Display[%d] connected. numHwLayers is zero", dpy);
-        } else {
-          hwc_session->hwc_display_[dpy]->Prepare(content_list);
-        }
-      }
-    }
-  }
-
-  if (hotplug_connect) {
-    // notify client
-    hwc_procs->hotplug(hwc_procs, HWC_DISPLAY_EXTERNAL, true);
-  }
-  // Return 0, else client will go into bad state
-  return 0;
+  auto status = hwc_session->CreateVirtualDisplayObject(width, height, format);
+  if (status == HWC2::Error::None)
+    *out_display_id = HWC_DISPLAY_VIRTUAL;
+  DLOGI("Created virtual display id:% " PRIu64 " with res: %dx%d", *out_display_id, width, height);
+  return INT32(status);
 }
 
-int HWCSession::GetVsyncPeriod(int disp) {
+int32_t HWCSession::DestroyLayer(hwc2_device_t *device, hwc2_display_t display,
+                                 hwc2_layer_t layer) {
   SCOPE_LOCK(locker_);
-  // default value
-  int32_t vsync_period = 1000000000l / 60;
-  const uint32_t attribute = HWC_DISPLAY_VSYNC_PERIOD;
-
-  if (hwc_display_[disp]) {
-    hwc_display_[disp]->GetDisplayAttributes(0, &attribute, &vsync_period);
-  }
-
-  return vsync_period;
+  return CallDisplayFunction(device, display, &HWCDisplay::DestroyLayer, layer);
 }
 
-int HWCSession::Set(hwc_composer_device_1 *device, size_t num_displays,
-                    hwc_display_contents_1_t **displays) {
-  DTRACE_SCOPED();
+int32_t HWCSession::DestroyVirtualDisplay(hwc2_device_t *device, hwc2_display_t display) {
+  SCOPE_LOCK(locker_);
+  if (!device) {
+    return HWC2_ERROR_BAD_DISPLAY;
+  }
 
+  DLOGI("Destroying virtual display id:%" PRIu64, display);
+  auto *hwc_session = static_cast<HWCSession *>(device);
+
+  if (hwc_session->hwc_display_[display]) {
+    HWCDisplayVirtual::Destroy(hwc_session->hwc_display_[display]);
+    return HWC2_ERROR_NONE;
+  } else {
+    return HWC2_ERROR_BAD_DISPLAY;
+  }
+}
+
+void HWCSession::Dump(hwc2_device_t *device, uint32_t *out_size, char *out_buffer) {
+  SEQUENCE_WAIT_SCOPE_LOCK(locker_);
+
+  if (!device) {
+    return;
+  }
+  auto *hwc_session = static_cast<HWCSession *>(device);
+
+  if (out_buffer == nullptr) {
+    *out_size = 8192;  // TODO(user): Adjust required dump size
+  } else {
+    char sdm_dump[4096];
+    DumpInterface::GetDump(sdm_dump, 4096);  // TODO(user): Fix this workaround
+    std::string s("");
+    for (int id = HWC_DISPLAY_PRIMARY; id <= HWC_DISPLAY_VIRTUAL; id++) {
+      if (hwc_session->hwc_display_[id]) {
+        s += hwc_session->hwc_display_[id]->Dump();
+      }
+    }
+    s += sdm_dump;
+    s.copy(out_buffer, s.size(), 0);
+    *out_size = sizeof(out_buffer);
+  }
+}
+
+static int32_t GetActiveConfig(hwc2_device_t *device, hwc2_display_t display,
+                               hwc2_config_t *out_config) {
+  return HWCSession::CallDisplayFunction(device, display, &HWCDisplay::GetActiveConfig, out_config);
+}
+
+static int32_t GetChangedCompositionTypes(hwc2_device_t *device, hwc2_display_t display,
+                                          uint32_t *out_num_elements, hwc2_layer_t *out_layers,
+                                          int32_t *out_types) {
+  return HWCSession::CallDisplayFunction(device, display, &HWCDisplay::GetChangedCompositionTypes,
+                                         out_num_elements, out_layers, out_types);
+}
+
+static int32_t GetClientTargetSupport(hwc2_device_t *device, hwc2_display_t display, uint32_t width,
+                                      uint32_t height, int32_t format, int32_t dataspace) {
+  return HWCSession::CallDisplayFunction(device, display, &HWCDisplay::GetClientTargetSupport,
+                                         width, height, format, dataspace);
+}
+
+static int32_t GetColorModes(hwc2_device_t *device, hwc2_display_t display, uint32_t *out_num_modes,
+                             int32_t /*android_color_mode_t*/ *int_out_modes) {
+  auto out_modes = reinterpret_cast<android_color_mode_t *>(int_out_modes);
+  return HWCSession::CallDisplayFunction(device, display, &HWCDisplay::GetColorModes, out_num_modes,
+                                         out_modes);
+}
+
+static int32_t GetDisplayAttribute(hwc2_device_t *device, hwc2_display_t display,
+                                   hwc2_config_t config, int32_t int_attribute,
+                                   int32_t *out_value) {
+  auto attribute = static_cast<HWC2::Attribute>(int_attribute);
+  return HWCSession::CallDisplayFunction(device, display, &HWCDisplay::GetDisplayAttribute, config,
+                                         attribute, out_value);
+}
+
+static int32_t GetDisplayConfigs(hwc2_device_t *device, hwc2_display_t display,
+                                 uint32_t *out_num_configs, hwc2_config_t *out_configs) {
+  return HWCSession::CallDisplayFunction(device, display, &HWCDisplay::GetDisplayConfigs,
+                                         out_num_configs, out_configs);
+}
+
+static int32_t GetDisplayName(hwc2_device_t *device, hwc2_display_t display, uint32_t *out_size,
+                              char *out_name) {
+  return HWCSession::CallDisplayFunction(device, display, &HWCDisplay::GetDisplayName, out_size,
+                                         out_name);
+}
+
+static int32_t GetDisplayRequests(hwc2_device_t *device, hwc2_display_t display,
+                                  int32_t *out_display_requests, uint32_t *out_num_elements,
+                                  hwc2_layer_t *out_layers, int32_t *out_layer_requests) {
+  return HWCSession::CallDisplayFunction(device, display, &HWCDisplay::GetDisplayRequests,
+                                         out_display_requests, out_num_elements, out_layers,
+                                         out_layer_requests);
+}
+
+static int32_t GetDisplayType(hwc2_device_t *device, hwc2_display_t display, int32_t *out_type) {
+  return HWCSession::CallDisplayFunction(device, display, &HWCDisplay::GetDisplayType, out_type);
+}
+
+static int32_t GetDozeSupport(hwc2_device_t *device, hwc2_display_t display, int32_t *out_support) {
+  // TODO(user): Check if it is an HDMI as primary display and disable support for it
+  if (display == HWC_DISPLAY_PRIMARY) {
+    *out_support = 1;
+  } else {
+    *out_support = 0;
+  }
+  return HWC2_ERROR_NONE;
+}
+
+static int32_t GetHdrCapabilities(hwc2_device_t* device, hwc2_display_t display,
+                                  uint32_t* out_num_types, int32_t* out_types,
+                                  float* out_max_luminance, float* out_max_average_luminance,
+                                  float* out_min_luminance) {
+  *out_num_types = 0;
+  return HWC2_ERROR_NONE;
+}
+
+static uint32_t GetMaxVirtualDisplayCount(hwc2_device_t *device) {
+  return 1;
+}
+
+static int32_t GetReleaseFences(hwc2_device_t *device, hwc2_display_t display,
+                                uint32_t *out_num_elements, hwc2_layer_t *out_layers,
+                                int32_t *out_fences) {
+  return HWCSession::CallDisplayFunction(device, display, &HWCDisplay::GetReleaseFences,
+                                         out_num_elements, out_layers, out_fences);
+}
+
+int32_t HWCSession::PresentDisplay(hwc2_device_t *device, hwc2_display_t display,
+                                   int32_t *out_retire_fence) {
+  HWCSession *hwc_session = static_cast<HWCSession *>(device);
+  DTRACE_SCOPED();
   SEQUENCE_EXIT_SCOPE_LOCK(locker_);
-
-  if (!device || !displays || num_displays > HWC_NUM_DISPLAY_TYPES) {
-    return -EINVAL;
-  }
-
-  HWCSession *hwc_session = static_cast<HWCSession *>(device);
-
-  if (hwc_session->color_mgr_) {
-    HWCDisplay *primary_display = hwc_session->hwc_display_[HWC_DISPLAY_PRIMARY];
-    if (primary_display) {
-      int ret = hwc_session->color_mgr_->SolidFillLayersSet(displays, primary_display);
-      if (ret)
-        return 0;
-    }
-  }
-
-  for (size_t dpy = 0; dpy < num_displays; dpy++) {
-    hwc_display_contents_1_t *content_list = displays[dpy];
-
-    // Drop virtual display composition if virtual display object could not be created
-    // due to HDMI concurrency.
-    if (dpy == HWC_DISPLAY_VIRTUAL && !hwc_session->hwc_display_[HWC_DISPLAY_VIRTUAL]) {
-      CloseAcquireFds(content_list);
-      if (content_list) {
-        content_list->retireFenceFd = -1;
-      }
-
-      continue;
-    }
-
-    if (hwc_session->hwc_display_[dpy]) {
-      hwc_session->hwc_display_[dpy]->Commit(content_list);
-    }
-    CloseAcquireFds(content_list);
-  }
-
-  if (hwc_session->new_bw_mode_) {
-    hwc_display_contents_1_t *content_list = displays[HWC_DISPLAY_PRIMARY];
-    hwc_session->new_bw_mode_ = false;
-    if (hwc_session->bw_mode_release_fd_ >= 0) {
-      close(hwc_session->bw_mode_release_fd_);
-    }
-    hwc_session->bw_mode_release_fd_ = dup(content_list->retireFenceFd);
-  }
-
-  // This is only indicative of how many times SurfaceFlinger posts
-  // frames to the display.
-  CALC_FPS();
-
-  // Return 0, else client will go into bad state
-  return 0;
-}
-
-void HWCSession::CloseAcquireFds(hwc_display_contents_1_t *content_list) {
-  if (content_list) {
-    for (size_t i = 0; i < content_list->numHwLayers; i++) {
-      int &acquireFenceFd = content_list->hwLayers[i].acquireFenceFd;
-      if (acquireFenceFd >= 0) {
-        close(acquireFenceFd);
-        acquireFenceFd = -1;
-      }
-    }
-
-    int &outbufAcquireFenceFd = content_list->outbufAcquireFenceFd;
-    if (outbufAcquireFenceFd >= 0) {
-      close(outbufAcquireFenceFd);
-      outbufAcquireFenceFd = -1;
-    }
-  }
-}
-
-bool HWCSession::IsDisplayYUV(int disp) {
-  int error = -EINVAL;
-  bool is_yuv = false;
-  DisplayConfigVariableInfo attributes = {};
-
-  if (disp < 0 || disp >= HWC_NUM_DISPLAY_TYPES || !hwc_display_[disp]) {
-    DLOGE("Invalid input parameters. Display = %d", disp);
-    return is_yuv;
-  }
-
-  uint32_t active_config = 0;
-  error = hwc_display_[disp]->GetActiveDisplayConfig(&active_config);
-  if (!error) {
-    error = hwc_display_[disp]->GetDisplayAttributesForConfig(INT(active_config), &attributes);
-    if (error == 0) {
-      is_yuv = attributes.is_yuv;
-    } else {
-      DLOGW("Error querying display attributes. Display = %d, Config = %d", disp, active_config);
-    }
-  }
-
-  return is_yuv;
-}
-
-int HWCSession::EventControl(hwc_composer_device_1 *device, int disp, int event, int enable) {
   if (!device) {
-    return -EINVAL;
+    return HWC2_ERROR_BAD_DISPLAY;
   }
 
-  HWCSession *hwc_session = static_cast<HWCSession *>(device);
-  int status = -EINVAL;
-  if (hwc_session->hwc_display_[disp]) {
-    status = hwc_session->hwc_display_[disp]->EventControl(event, enable);
+  auto status = HWC2::Error::BadDisplay;
+  // TODO(user): Handle virtual display/HDMI concurrency
+  if (hwc_session->hwc_display_[display]) {
+    status = hwc_session->hwc_display_[display]->Present(out_retire_fence);
+    // This is only indicative of how many times SurfaceFlinger posts
+    // frames to the display.
+    CALC_FPS();
   }
 
-  return status;
+  return INT32(status);
 }
 
-int HWCSession::SetPowerMode(hwc_composer_device_1 *device, int disp, int mode) {
+int32_t HWCSession::RegisterCallback(hwc2_device_t *device, int32_t descriptor,
+                                     hwc2_callback_data_t callback_data,
+                                     hwc2_function_pointer_t pointer) {
+  HWCSession *hwc_session = static_cast<HWCSession *>(device);
+  if (!device) {
+    return HWC2_ERROR_BAD_DISPLAY;
+  }
+  auto desc = static_cast<HWC2::Callback>(descriptor);
+  auto error = hwc_session->callbacks_.Register(desc, callback_data, pointer);
+  DLOGD("Registering callback: %s", to_string(desc).c_str());
+  if (descriptor == HWC2_CALLBACK_HOTPLUG)
+    hwc_session->callbacks_.Hotplug(HWC_DISPLAY_PRIMARY, HWC2::Connection::Connected);
+  return INT32(error);
+}
+
+static int32_t SetActiveConfig(hwc2_device_t *device, hwc2_display_t display,
+                               hwc2_config_t config) {
+  return HWCSession::CallDisplayFunction(device, display, &HWCDisplay::SetActiveConfig, config);
+}
+
+static int32_t SetClientTarget(hwc2_device_t *device, hwc2_display_t display,
+                               buffer_handle_t target, int32_t acquire_fence,
+                               int32_t dataspace, hwc_region_t damage) {
+  return HWCSession::CallDisplayFunction(device, display, &HWCDisplay::SetClientTarget, target,
+                                         acquire_fence, dataspace, damage);
+}
+
+int32_t HWCSession::SetColorMode(hwc2_device_t *device, hwc2_display_t display,
+                                 int32_t /*android_color_mode_t*/ int_mode) {
+  auto mode = static_cast<android_color_mode_t>(int_mode);
   SEQUENCE_WAIT_SCOPE_LOCK(locker_);
-
-  if (!device) {
-    return -EINVAL;
-  }
-
-  HWCSession *hwc_session = static_cast<HWCSession *>(device);
-  int status = -EINVAL;
-  if (hwc_session->hwc_display_[disp]) {
-    status = hwc_session->hwc_display_[disp]->SetPowerMode(mode);
-  }
-
-  return status;
+  return HWCSession::CallDisplayFunction(device, display, &HWCDisplay::SetColorMode, mode);
 }
 
-int HWCSession::Query(hwc_composer_device_1 *device, int param, int *value) {
-  SCOPE_LOCK(locker_);
-
-  if (!device || !value) {
-    return -EINVAL;
-  }
-
-  int status = 0;
-
-  switch (param) {
-  case HWC_BACKGROUND_LAYER_SUPPORTED:
-    value[0] = 1;
-    break;
-
-  default:
-    status = -EINVAL;
-  }
-
-  return status;
-}
-
-void HWCSession::RegisterProcs(hwc_composer_device_1 *device, hwc_procs_t const *procs) {
-  SCOPE_LOCK(locker_);
-
-  if (!device || !procs) {
-    return;
-  }
-
-  HWCSession *hwc_session = static_cast<HWCSession *>(device);
-  hwc_session->hwc_procs_ = procs;
-}
-
-void HWCSession::Dump(hwc_composer_device_1 *device, char *buffer, int length) {
+int32_t HWCSession::SetColorTransform(hwc2_device_t *device, hwc2_display_t display,
+                                      const float *matrix,
+                                      int32_t /*android_color_transform_t*/ hint) {
   SEQUENCE_WAIT_SCOPE_LOCK(locker_);
-
-  if (!device || !buffer || !length) {
-    return;
-  }
-
-  DumpInterface::GetDump(buffer, UINT32(length));
+  android_color_transform_t transform_hint = static_cast<android_color_transform_t>(hint);
+  return HWCSession::CallDisplayFunction(device, display, &HWCDisplay::SetColorTransform, matrix,
+                                         transform_hint);
 }
 
-int HWCSession::GetDisplayConfigs(hwc_composer_device_1 *device, int disp, uint32_t *configs,
-                                  size_t *num_configs) {
-  SCOPE_LOCK(locker_);
-
-  if (!device || !configs || !num_configs) {
-    return -EINVAL;
-  }
-
-  if (disp < HWC_DISPLAY_PRIMARY || disp >  HWC_NUM_PHYSICAL_DISPLAY_TYPES) {
-    return -EINVAL;
-  }
-
-  HWCSession *hwc_session = static_cast<HWCSession *>(device);
-  int status = -EINVAL;
-  if (hwc_session->hwc_display_[disp]) {
-    status = hwc_session->hwc_display_[disp]->GetDisplayConfigs(configs, num_configs);
-  }
-
-  return status;
+static int32_t SetCursorPosition(hwc2_device_t *device, hwc2_display_t display, hwc2_layer_t layer,
+                                 int32_t x, int32_t y) {
+  return HWCSession::CallDisplayFunction(device, display, &HWCDisplay::SetCursorPosition, layer, x,
+                                         y);
 }
 
-int HWCSession::GetDisplayAttributes(hwc_composer_device_1 *device, int disp, uint32_t config,
-                                     const uint32_t *display_attributes, int32_t *values) {
-  SCOPE_LOCK(locker_);
-
-  if (!device || !display_attributes || !values) {
-    return -EINVAL;
-  }
-
-  if (disp < HWC_DISPLAY_PRIMARY || disp >  HWC_NUM_PHYSICAL_DISPLAY_TYPES) {
-    return -EINVAL;
-  }
-
-  HWCSession *hwc_session = static_cast<HWCSession *>(device);
-  int status = -EINVAL;
-  if (hwc_session->hwc_display_[disp]) {
-    status = hwc_session->hwc_display_[disp]->GetDisplayAttributes(config, display_attributes,
-                                                                   values);
-  }
-
-  return status;
+static int32_t SetLayerBlendMode(hwc2_device_t *device, hwc2_display_t display, hwc2_layer_t layer,
+                                 int32_t int_mode) {
+  auto mode = static_cast<HWC2::BlendMode>(int_mode);
+  return HWCSession::CallLayerFunction(device, display, layer, &HWCLayer::SetLayerBlendMode, mode);
 }
 
-int HWCSession::GetActiveConfig(hwc_composer_device_1 *device, int disp) {
-  SCOPE_LOCK(locker_);
+static int32_t SetLayerBuffer(hwc2_device_t *device, hwc2_display_t display, hwc2_layer_t layer,
+                              buffer_handle_t buffer, int32_t acquire_fence) {
+  return HWCSession::CallLayerFunction(device, display, layer, &HWCLayer::SetLayerBuffer, buffer,
+                                       acquire_fence);
+}
 
+static int32_t SetLayerColor(hwc2_device_t *device, hwc2_display_t display, hwc2_layer_t layer,
+                             hwc_color_t color) {
+  return HWCSession::CallLayerFunction(device, display, layer, &HWCLayer::SetLayerColor, color);
+}
+
+static int32_t SetLayerCompositionType(hwc2_device_t *device, hwc2_display_t display,
+                                       hwc2_layer_t layer, int32_t int_type) {
+  auto type = static_cast<HWC2::Composition>(int_type);
+  return HWCSession::CallLayerFunction(device, display, layer, &HWCLayer::SetLayerCompositionType,
+                                       type);
+}
+
+static int32_t SetLayerDataspace(hwc2_device_t *device, hwc2_display_t display, hwc2_layer_t layer,
+                                 int32_t dataspace) {
+  return HWCSession::CallLayerFunction(device, display, layer, &HWCLayer::SetLayerDataspace,
+                                       dataspace);
+}
+
+static int32_t SetLayerDisplayFrame(hwc2_device_t *device, hwc2_display_t display,
+                                    hwc2_layer_t layer, hwc_rect_t frame) {
+  return HWCSession::CallLayerFunction(device, display, layer, &HWCLayer::SetLayerDisplayFrame,
+                                       frame);
+}
+
+static int32_t SetLayerPlaneAlpha(hwc2_device_t *device, hwc2_display_t display, hwc2_layer_t layer,
+                                  float alpha) {
+  return HWCSession::CallLayerFunction(device, display, layer, &HWCLayer::SetLayerPlaneAlpha,
+                                       alpha);
+}
+
+static int32_t SetLayerSourceCrop(hwc2_device_t *device, hwc2_display_t display, hwc2_layer_t layer,
+                                  hwc_frect_t crop) {
+  return HWCSession::CallLayerFunction(device, display, layer, &HWCLayer::SetLayerSourceCrop, crop);
+}
+
+static int32_t SetLayerSurfaceDamage(hwc2_device_t *device, hwc2_display_t display,
+                                     hwc2_layer_t layer, hwc_region_t damage) {
+  return HWCSession::CallLayerFunction(device, display, layer, &HWCLayer::SetLayerSurfaceDamage,
+                                       damage);
+}
+
+static int32_t SetLayerTransform(hwc2_device_t *device, hwc2_display_t display, hwc2_layer_t layer,
+                                 int32_t int_transform) {
+  auto transform = static_cast<HWC2::Transform>(int_transform);
+  return HWCSession::CallLayerFunction(device, display, layer, &HWCLayer::SetLayerTransform,
+                                       transform);
+}
+
+static int32_t SetLayerVisibleRegion(hwc2_device_t *device, hwc2_display_t display,
+                                     hwc2_layer_t layer, hwc_region_t visible) {
+  return HWCSession::CallLayerFunction(device, display, layer, &HWCLayer::SetLayerVisibleRegion,
+                                       visible);
+}
+
+int32_t HWCSession::SetLayerZOrder(hwc2_device_t *device, hwc2_display_t display,
+                                   hwc2_layer_t layer, uint32_t z) {
+  SCOPE_LOCK(locker_);
+  return CallDisplayFunction(device, display, &HWCDisplay::SetLayerZOrder, layer, z);
+}
+
+int32_t HWCSession::SetOutputBuffer(hwc2_device_t *device, hwc2_display_t display,
+                                    buffer_handle_t buffer, int32_t releaseFence) {
   if (!device) {
-    return -EINVAL;
+    return HWC2_ERROR_BAD_DISPLAY;
   }
 
-  if (disp < HWC_DISPLAY_PRIMARY || disp >  HWC_NUM_PHYSICAL_DISPLAY_TYPES) {
-    return -EINVAL;
+  auto *hwc_session = static_cast<HWCSession *>(device);
+  if (display == HWC_DISPLAY_VIRTUAL && hwc_session->hwc_display_[display]) {
+    auto vds = reinterpret_cast<HWCDisplayVirtual *>(hwc_session->hwc_display_[display]);
+    auto status = vds->SetOutputBuffer(buffer, releaseFence);
+    return INT32(status);
+  } else {
+    return HWC2_ERROR_BAD_DISPLAY;
   }
-
-  HWCSession *hwc_session = static_cast<HWCSession *>(device);
-  int active_config = -1;
-  if (hwc_session->hwc_display_[disp]) {
-    active_config = hwc_session->hwc_display_[disp]->GetActiveConfig();
-  }
-
-  return active_config;
 }
 
-int HWCSession::SetActiveConfig(hwc_composer_device_1 *device, int disp, int index) {
+int32_t HWCSession::SetPowerMode(hwc2_device_t *device, hwc2_display_t display, int32_t int_mode) {
+  auto mode = static_cast<HWC2::PowerMode>(int_mode);
   SEQUENCE_WAIT_SCOPE_LOCK(locker_);
-
-  if (!device) {
-    return -EINVAL;
-  }
-
-  if (disp < HWC_DISPLAY_PRIMARY || disp >  HWC_NUM_PHYSICAL_DISPLAY_TYPES) {
-    return -EINVAL;
-  }
-
-  HWCSession *hwc_session = static_cast<HWCSession *>(device);
-  int status = -EINVAL;
-
-  if (hwc_session->hwc_display_[disp]) {
-    status = hwc_session->hwc_display_[disp]->SetActiveConfig(index);
-  }
-
-  return status;
+  return CallDisplayFunction(device, display, &HWCDisplay::SetPowerMode, mode);
 }
 
-int HWCSession::SetCursorPositionAsync(hwc_composer_device_1 *device, int disp, int x, int y) {
+static int32_t SetVsyncEnabled(hwc2_device_t *device, hwc2_display_t display, int32_t int_enabled) {
+  auto enabled = static_cast<HWC2::Vsync>(int_enabled);
+  return HWCSession::CallDisplayFunction(device, display, &HWCDisplay::SetVsyncEnabled, enabled);
+}
+
+int32_t HWCSession::ValidateDisplay(hwc2_device_t *device, hwc2_display_t display,
+                                    uint32_t *out_num_types, uint32_t *out_num_requests) {
   DTRACE_SCOPED();
-
-  SCOPE_LOCK(locker_);
-
-  if (!device || (disp < HWC_DISPLAY_PRIMARY) || (disp > HWC_DISPLAY_VIRTUAL)) {
-    return -EINVAL;
-  }
-
-  int status = -EINVAL;
   HWCSession *hwc_session = static_cast<HWCSession *>(device);
-  if (hwc_session->hwc_display_[disp]) {
-    status = hwc_session->hwc_display_[disp]->SetCursorPosition(x, y);
+  if (!device) {
+    return HWC2_ERROR_BAD_DISPLAY;
   }
 
-  return status;
+  // TODO(user): Handle secure session, handle QDCM solid fill
+  // Handle external_pending_connect_ in CreateVirtualDisplay
+  auto status = HWC2::Error::BadDisplay;
+  if (hwc_session->hwc_display_[display]) {
+    SEQUENCE_ENTRY_SCOPE_LOCK(locker_);
+    if (display == HWC_DISPLAY_PRIMARY) {
+      // TODO(user): This can be moved to HWCDisplayPrimary
+      if (hwc_session->reset_panel_) {
+        DLOGW("panel is in bad state, resetting the panel");
+        hwc_session->ResetPanel();
+      }
+
+      if (hwc_session->need_invalidate_) {
+        hwc_session->callbacks_.Refresh(display);
+      }
+    }
+
+    status = hwc_session->hwc_display_[display]->Validate(out_num_types, out_num_requests);
+  }
+  // If validate fails, cancel the sequence lock so that other operations
+  // (such as Dump or SetPowerMode) may succeed without blocking on the condition
+  if (status == HWC2::Error::BadDisplay) {
+    SEQUENCE_CANCEL_SCOPE_LOCK(locker_);
+  }
+  return INT32(status);
 }
 
-int HWCSession::ConnectDisplay(int disp, hwc_display_contents_1_t *content_list) {
+hwc2_function_pointer_t HWCSession::GetFunction(struct hwc2_device *device,
+                                                int32_t int_descriptor) {
+  auto descriptor = static_cast<HWC2::FunctionDescriptor>(int_descriptor);
+
+  switch (descriptor) {
+    case HWC2::FunctionDescriptor::AcceptDisplayChanges:
+      return AsFP<HWC2_PFN_ACCEPT_DISPLAY_CHANGES>(AcceptDisplayChanges);
+    case HWC2::FunctionDescriptor::CreateLayer:
+      return AsFP<HWC2_PFN_CREATE_LAYER>(CreateLayer);
+    case HWC2::FunctionDescriptor::CreateVirtualDisplay:
+      return AsFP<HWC2_PFN_CREATE_VIRTUAL_DISPLAY>(HWCSession::CreateVirtualDisplay);
+    case HWC2::FunctionDescriptor::DestroyLayer:
+      return AsFP<HWC2_PFN_DESTROY_LAYER>(DestroyLayer);
+    case HWC2::FunctionDescriptor::DestroyVirtualDisplay:
+      return AsFP<HWC2_PFN_DESTROY_VIRTUAL_DISPLAY>(HWCSession::DestroyVirtualDisplay);
+    case HWC2::FunctionDescriptor::Dump:
+      return AsFP<HWC2_PFN_DUMP>(HWCSession::Dump);
+    case HWC2::FunctionDescriptor::GetActiveConfig:
+      return AsFP<HWC2_PFN_GET_ACTIVE_CONFIG>(GetActiveConfig);
+    case HWC2::FunctionDescriptor::GetChangedCompositionTypes:
+      return AsFP<HWC2_PFN_GET_CHANGED_COMPOSITION_TYPES>(GetChangedCompositionTypes);
+    case HWC2::FunctionDescriptor::GetClientTargetSupport:
+      return AsFP<HWC2_PFN_GET_CLIENT_TARGET_SUPPORT>(GetClientTargetSupport);
+    case HWC2::FunctionDescriptor::GetColorModes:
+      return AsFP<HWC2_PFN_GET_COLOR_MODES>(GetColorModes);
+    case HWC2::FunctionDescriptor::GetDisplayAttribute:
+      return AsFP<HWC2_PFN_GET_DISPLAY_ATTRIBUTE>(GetDisplayAttribute);
+    case HWC2::FunctionDescriptor::GetDisplayConfigs:
+      return AsFP<HWC2_PFN_GET_DISPLAY_CONFIGS>(GetDisplayConfigs);
+    case HWC2::FunctionDescriptor::GetDisplayName:
+      return AsFP<HWC2_PFN_GET_DISPLAY_NAME>(GetDisplayName);
+    case HWC2::FunctionDescriptor::GetDisplayRequests:
+      return AsFP<HWC2_PFN_GET_DISPLAY_REQUESTS>(GetDisplayRequests);
+    case HWC2::FunctionDescriptor::GetDisplayType:
+      return AsFP<HWC2_PFN_GET_DISPLAY_TYPE>(GetDisplayType);
+    case HWC2::FunctionDescriptor::GetHdrCapabilities:
+      return AsFP<HWC2_PFN_GET_HDR_CAPABILITIES>(GetHdrCapabilities);
+    case HWC2::FunctionDescriptor::GetDozeSupport:
+      return AsFP<HWC2_PFN_GET_DOZE_SUPPORT>(GetDozeSupport);
+    case HWC2::FunctionDescriptor::GetMaxVirtualDisplayCount:
+      return AsFP<HWC2_PFN_GET_MAX_VIRTUAL_DISPLAY_COUNT>(GetMaxVirtualDisplayCount);
+    case HWC2::FunctionDescriptor::GetReleaseFences:
+      return AsFP<HWC2_PFN_GET_RELEASE_FENCES>(GetReleaseFences);
+    case HWC2::FunctionDescriptor::PresentDisplay:
+      return AsFP<HWC2_PFN_PRESENT_DISPLAY>(PresentDisplay);
+    case HWC2::FunctionDescriptor::RegisterCallback:
+      return AsFP<HWC2_PFN_REGISTER_CALLBACK>(RegisterCallback);
+    case HWC2::FunctionDescriptor::SetActiveConfig:
+      return AsFP<HWC2_PFN_SET_ACTIVE_CONFIG>(SetActiveConfig);
+    case HWC2::FunctionDescriptor::SetClientTarget:
+      return AsFP<HWC2_PFN_SET_CLIENT_TARGET>(SetClientTarget);
+    case HWC2::FunctionDescriptor::SetColorMode:
+      return AsFP<HWC2_PFN_SET_COLOR_MODE>(SetColorMode);
+    case HWC2::FunctionDescriptor::SetColorTransform:
+      return AsFP<HWC2_PFN_SET_COLOR_TRANSFORM>(SetColorTransform);
+    case HWC2::FunctionDescriptor::SetCursorPosition:
+      return AsFP<HWC2_PFN_SET_CURSOR_POSITION>(SetCursorPosition);
+    case HWC2::FunctionDescriptor::SetLayerBlendMode:
+      return AsFP<HWC2_PFN_SET_LAYER_BLEND_MODE>(SetLayerBlendMode);
+    case HWC2::FunctionDescriptor::SetLayerBuffer:
+      return AsFP<HWC2_PFN_SET_LAYER_BUFFER>(SetLayerBuffer);
+    case HWC2::FunctionDescriptor::SetLayerColor:
+      return AsFP<HWC2_PFN_SET_LAYER_COLOR>(SetLayerColor);
+    case HWC2::FunctionDescriptor::SetLayerCompositionType:
+      return AsFP<HWC2_PFN_SET_LAYER_COMPOSITION_TYPE>(SetLayerCompositionType);
+    case HWC2::FunctionDescriptor::SetLayerDataspace:
+      return AsFP<HWC2_PFN_SET_LAYER_DATASPACE>(SetLayerDataspace);
+    case HWC2::FunctionDescriptor::SetLayerDisplayFrame:
+      return AsFP<HWC2_PFN_SET_LAYER_DISPLAY_FRAME>(SetLayerDisplayFrame);
+    case HWC2::FunctionDescriptor::SetLayerPlaneAlpha:
+      return AsFP<HWC2_PFN_SET_LAYER_PLANE_ALPHA>(SetLayerPlaneAlpha);
+    // Sideband stream is not supported
+    // case HWC2::FunctionDescriptor::SetLayerSidebandStream:
+    case HWC2::FunctionDescriptor::SetLayerSourceCrop:
+      return AsFP<HWC2_PFN_SET_LAYER_SOURCE_CROP>(SetLayerSourceCrop);
+    case HWC2::FunctionDescriptor::SetLayerSurfaceDamage:
+      return AsFP<HWC2_PFN_SET_LAYER_SURFACE_DAMAGE>(SetLayerSurfaceDamage);
+    case HWC2::FunctionDescriptor::SetLayerTransform:
+      return AsFP<HWC2_PFN_SET_LAYER_TRANSFORM>(SetLayerTransform);
+    case HWC2::FunctionDescriptor::SetLayerVisibleRegion:
+      return AsFP<HWC2_PFN_SET_LAYER_VISIBLE_REGION>(SetLayerVisibleRegion);
+    case HWC2::FunctionDescriptor::SetLayerZOrder:
+      return AsFP<HWC2_PFN_SET_LAYER_Z_ORDER>(SetLayerZOrder);
+    case HWC2::FunctionDescriptor::SetOutputBuffer:
+      return AsFP<HWC2_PFN_SET_OUTPUT_BUFFER>(SetOutputBuffer);
+    case HWC2::FunctionDescriptor::SetPowerMode:
+      return AsFP<HWC2_PFN_SET_POWER_MODE>(SetPowerMode);
+    case HWC2::FunctionDescriptor::SetVsyncEnabled:
+      return AsFP<HWC2_PFN_SET_VSYNC_ENABLED>(SetVsyncEnabled);
+    case HWC2::FunctionDescriptor::ValidateDisplay:
+      return AsFP<HWC2_PFN_VALIDATE_DISPLAY>(HWCSession::ValidateDisplay);
+    default:
+      DLOGD("Unknown/Unimplemented function descriptor: %d (%s)", int_descriptor,
+            to_string(descriptor).c_str());
+      return nullptr;
+  }
+  return nullptr;
+}
+
+// TODO(user): handle locking
+
+HWC2::Error HWCSession::CreateVirtualDisplayObject(uint32_t width, uint32_t height,
+                                                   int32_t *format) {
+  if (hwc_display_[HWC_DISPLAY_VIRTUAL]) {
+    return HWC2::Error::NoResources;
+  }
+  auto status = HWCDisplayVirtual::Create(core_intf_, &callbacks_, width, height, format,
+                                          &hwc_display_[HWC_DISPLAY_VIRTUAL]);
+  // TODO(user): validate width and height support
+  if (status)
+    return HWC2::Error::Unsupported;
+
+  return HWC2::Error::None;
+}
+
+int32_t HWCSession::ConnectDisplay(int disp) {
   DLOGI("Display = %d", disp);
 
   int status = 0;
@@ -645,20 +712,15 @@ int HWCSession::ConnectDisplay(int disp, hwc_display_contents_1_t *content_list)
   hwc_display_[HWC_DISPLAY_PRIMARY]->GetFrameBufferResolution(&primary_width, &primary_height);
 
   if (disp == HWC_DISPLAY_EXTERNAL) {
-    status = HWCDisplayExternal::Create(core_intf_, &hwc_procs_, primary_width, primary_height,
+    status = HWCDisplayExternal::Create(core_intf_, &callbacks_, primary_width, primary_height,
                                         qservice_, false, &hwc_display_[disp]);
-    connected_displays_[HWC_DISPLAY_EXTERNAL] = 1;
-  } else if (disp == HWC_DISPLAY_VIRTUAL) {
-    status = HWCDisplayVirtual::Create(core_intf_, &hwc_procs_, primary_width, primary_height,
-                                       content_list, &hwc_display_[disp]);
-    connected_displays_[HWC_DISPLAY_VIRTUAL] = 1;
   } else {
     DLOGE("Invalid display type");
     return -1;
   }
 
   if (!status) {
-    hwc_display_[disp]->SetSecureDisplay(secure_display_active_, true);
+    hwc_display_[disp]->SetSecureDisplay(secure_display_active_);
   }
 
   return status;
@@ -669,10 +731,8 @@ int HWCSession::DisconnectDisplay(int disp) {
 
   if (disp == HWC_DISPLAY_EXTERNAL) {
     HWCDisplayExternal::Destroy(hwc_display_[disp]);
-    connected_displays_[HWC_DISPLAY_EXTERNAL] = 0;
   } else if (disp == HWC_DISPLAY_VIRTUAL) {
     HWCDisplayVirtual::Destroy(hwc_display_[disp]);
-    connected_displays_[HWC_DISPLAY_VIRTUAL] = 0;
   } else {
     DLOGE("Invalid display type");
     return -1;
@@ -683,6 +743,7 @@ int HWCSession::DisconnectDisplay(int disp) {
   return 0;
 }
 
+// Qclient methods
 android::status_t HWCSession::notifyCallback(uint32_t command, const android::Parcel *input_parcel,
                                              android::Parcel *output_parcel) {
   SEQUENCE_WAIT_SCOPE_LOCK(locker_);
@@ -690,103 +751,107 @@ android::status_t HWCSession::notifyCallback(uint32_t command, const android::Pa
   android::status_t status = 0;
 
   switch (command) {
-  case qService::IQService::DYNAMIC_DEBUG:
-    DynamicDebug(input_parcel);
-    break;
+    case qService::IQService::DYNAMIC_DEBUG:
+      DynamicDebug(input_parcel);
+      break;
 
-  case qService::IQService::SCREEN_REFRESH:
-    hwc_procs_->invalidate(hwc_procs_);
-    break;
+    case qService::IQService::SCREEN_REFRESH:
+      callbacks_.Refresh(HWC_DISPLAY_PRIMARY);
+      break;
 
-  case qService::IQService::SET_IDLE_TIMEOUT:
-    if (hwc_display_[HWC_DISPLAY_PRIMARY]) {
-      uint32_t timeout = UINT32(input_parcel->readInt32());
-      hwc_display_[HWC_DISPLAY_PRIMARY]->SetIdleTimeoutMs(timeout);
-    }
-    break;
+    case qService::IQService::SET_IDLE_TIMEOUT:
+      if (hwc_display_[HWC_DISPLAY_PRIMARY]) {
+        uint32_t timeout = UINT32(input_parcel->readInt32());
+        hwc_display_[HWC_DISPLAY_PRIMARY]->SetIdleTimeoutMs(timeout);
+      }
+      break;
 
-  case qService::IQService::SET_FRAME_DUMP_CONFIG:
-    SetFrameDumpConfig(input_parcel);
-    break;
+    case qService::IQService::SET_FRAME_DUMP_CONFIG:
+      SetFrameDumpConfig(input_parcel);
+      break;
 
-  case qService::IQService::SET_MAX_PIPES_PER_MIXER:
-    status = SetMaxMixerStages(input_parcel);
-    break;
+    case qService::IQService::SET_MAX_PIPES_PER_MIXER:
+      status = SetMaxMixerStages(input_parcel);
+      break;
 
-  case qService::IQService::SET_DISPLAY_MODE:
-    status = SetDisplayMode(input_parcel);
-    break;
+    case qService::IQService::SET_DISPLAY_MODE:
+      status = SetDisplayMode(input_parcel);
+      break;
 
-  case qService::IQService::SET_SECONDARY_DISPLAY_STATUS:
-    status = SetSecondaryDisplayStatus(input_parcel, output_parcel);
-    break;
+    case qService::IQService::SET_SECONDARY_DISPLAY_STATUS:
+      status = SetSecondaryDisplayStatus(input_parcel, output_parcel);
+      break;
 
-  case qService::IQService::CONFIGURE_DYN_REFRESH_RATE:
-    status = ConfigureRefreshRate(input_parcel);
-    break;
+    case qService::IQService::CONFIGURE_DYN_REFRESH_RATE:
+      status = ConfigureRefreshRate(input_parcel);
+      break;
 
-  case qService::IQService::SET_VIEW_FRAME:
-    break;
+    case qService::IQService::SET_VIEW_FRAME:
+      break;
 
-  case qService::IQService::TOGGLE_SCREEN_UPDATES:
-    status = ToggleScreenUpdates(input_parcel, output_parcel);
-    break;
+    case qService::IQService::TOGGLE_SCREEN_UPDATES:
+      status = ToggleScreenUpdates(input_parcel, output_parcel);
+      break;
 
-  case qService::IQService::QDCM_SVC_CMDS:
-    status = QdcmCMDHandler(input_parcel, output_parcel);
-    break;
+    case qService::IQService::QDCM_SVC_CMDS:
+      status = QdcmCMDHandler(input_parcel, output_parcel);
+      break;
 
-  case qService::IQService::MIN_HDCP_ENCRYPTION_LEVEL_CHANGED:
-    status = OnMinHdcpEncryptionLevelChange(input_parcel, output_parcel);
-    break;
+    case qService::IQService::MIN_HDCP_ENCRYPTION_LEVEL_CHANGED:
+      status = OnMinHdcpEncryptionLevelChange(input_parcel, output_parcel);
+      break;
 
-  case qService::IQService::CONTROL_PARTIAL_UPDATE:
-    status = ControlPartialUpdate(input_parcel, output_parcel);
-    break;
+    case qService::IQService::CONTROL_PARTIAL_UPDATE:
+      status = ControlPartialUpdate(input_parcel, output_parcel);
+      break;
 
-  case qService::IQService::SET_ACTIVE_CONFIG:
-    status = HandleSetActiveDisplayConfig(input_parcel, output_parcel);
-    break;
+    case qService::IQService::SET_ACTIVE_CONFIG:
+      status = HandleSetActiveDisplayConfig(input_parcel, output_parcel);
+      break;
 
-  case qService::IQService::GET_ACTIVE_CONFIG:
-    status = HandleGetActiveDisplayConfig(input_parcel, output_parcel);
-    break;
+    case qService::IQService::GET_ACTIVE_CONFIG:
+      status = HandleGetActiveDisplayConfig(input_parcel, output_parcel);
+      break;
 
-  case qService::IQService::GET_CONFIG_COUNT:
-    status = HandleGetDisplayConfigCount(input_parcel, output_parcel);
-    break;
+    case qService::IQService::GET_CONFIG_COUNT:
+      status = HandleGetDisplayConfigCount(input_parcel, output_parcel);
+      break;
 
-  case qService::IQService::GET_DISPLAY_ATTRIBUTES_FOR_CONFIG:
-    status = HandleGetDisplayAttributesForConfig(input_parcel, output_parcel);
-    break;
+    case qService::IQService::GET_DISPLAY_ATTRIBUTES_FOR_CONFIG:
+      status = HandleGetDisplayAttributesForConfig(input_parcel, output_parcel);
+      break;
 
-  case qService::IQService::GET_PANEL_BRIGHTNESS:
-    status = GetPanelBrightness(input_parcel, output_parcel);
-    break;
+    case qService::IQService::GET_PANEL_BRIGHTNESS:
+      status = GetPanelBrightness(input_parcel, output_parcel);
+      break;
 
-  case qService::IQService::SET_PANEL_BRIGHTNESS:
-    status = SetPanelBrightness(input_parcel, output_parcel);
-    break;
+    case qService::IQService::SET_PANEL_BRIGHTNESS:
+      status = SetPanelBrightness(input_parcel, output_parcel);
+      break;
 
-  case qService::IQService::GET_DISPLAY_VISIBLE_REGION:
-    status = GetVisibleDisplayRect(input_parcel, output_parcel);
-    break;
+    case qService::IQService::GET_DISPLAY_VISIBLE_REGION:
+      status = GetVisibleDisplayRect(input_parcel, output_parcel);
+      break;
 
-  case qService::IQService::SET_CAMERA_STATUS:
-    status = SetDynamicBWForCamera(input_parcel, output_parcel);
-    break;
+    case qService::IQService::SET_CAMERA_STATUS:
+      status = SetDynamicBWForCamera(input_parcel, output_parcel);
+      break;
 
-  case qService::IQService::GET_BW_TRANSACTION_STATUS:
-    status = GetBWTransactionStatus(input_parcel, output_parcel);
-    break;
+    case qService::IQService::GET_BW_TRANSACTION_STATUS:
+      status = GetBWTransactionStatus(input_parcel, output_parcel);
+      break;
 
-  case qService::IQService::SET_LAYER_MIXER_RESOLUTION:
-    status = SetMixerResolution(input_parcel);
-    break;
+    case qService::IQService::SET_LAYER_MIXER_RESOLUTION:
+      status = SetMixerResolution(input_parcel);
+      break;
 
-  default:
-    DLOGW("QService command = %d is not supported", command);
-    return -EINVAL;
+    case qService::IQService::SET_COLOR_MODE:
+      status = SetColorModeOverride(input_parcel);
+      break;
+
+    default:
+      DLOGW("QService command = %d is not supported", command);
+      return -EINVAL;
   }
 
   return status;
@@ -880,7 +945,7 @@ android::status_t HWCSession::ControlPartialUpdate(const android::Parcel *input_
   }
 
   // Todo(user): Unlock it before sending events to client. It may cause deadlocks in future.
-  hwc_procs_->invalidate(hwc_procs_);
+  callbacks_.Refresh(HWC_DISPLAY_PRIMARY);
 
   // Wait until partial update control is complete
   ret = locker_.WaitFinite(kPartialUpdateControlTimeoutMs);
@@ -891,7 +956,7 @@ android::status_t HWCSession::ControlPartialUpdate(const android::Parcel *input_
 }
 
 android::status_t HWCSession::HandleSetActiveDisplayConfig(const android::Parcel *input_parcel,
-                                                     android::Parcel *output_parcel) {
+                                                           android::Parcel *output_parcel) {
   int config = input_parcel->readInt32();
   int dpy = input_parcel->readInt32();
   int error = android::BAD_VALUE;
@@ -903,7 +968,7 @@ android::status_t HWCSession::HandleSetActiveDisplayConfig(const android::Parcel
   if (hwc_display_[dpy]) {
     error = hwc_display_[dpy]->SetActiveDisplayConfig(config);
     if (error == 0) {
-      hwc_procs_->invalidate(hwc_procs_);
+      callbacks_.Refresh(0);
     }
   }
 
@@ -950,41 +1015,6 @@ android::status_t HWCSession::HandleGetDisplayConfigCount(const android::Parcel 
   return error;
 }
 
-android::status_t HWCSession::SetDisplayPort(DisplayPort sdm_disp_port, int *hwc_disp_port) {
-  if (!hwc_disp_port) {
-    return -EINVAL;
-  }
-
-  switch (sdm_disp_port) {
-    case kPortDSI:
-      *hwc_disp_port = qdutils::DISPLAY_PORT_DSI;
-      break;
-    case kPortDTV:
-      *hwc_disp_port = qdutils::DISPLAY_PORT_DTV;
-      break;
-    case kPortLVDS:
-      *hwc_disp_port = qdutils::DISPLAY_PORT_LVDS;
-      break;
-    case kPortEDP:
-      *hwc_disp_port = qdutils::DISPLAY_PORT_EDP;
-      break;
-    case kPortWriteBack:
-      *hwc_disp_port = qdutils::DISPLAY_PORT_WRITEBACK;
-      break;
-    case kPortDP:
-      *hwc_disp_port = qdutils::DISPLAY_PORT_DP;
-      break;
-    case kPortDefault:
-      *hwc_disp_port = qdutils::DISPLAY_PORT_DEFAULT;
-      break;
-    default:
-      DLOGE("Invalid sdm display port %d", sdm_disp_port);
-      return -EINVAL;
-  }
-
-  return 0;
-}
-
 android::status_t HWCSession::HandleGetDisplayAttributesForConfig(const android::Parcel
                                                                   *input_parcel,
                                                                   android::Parcel *output_parcel) {
@@ -992,8 +1022,6 @@ android::status_t HWCSession::HandleGetDisplayAttributesForConfig(const android:
   int dpy = input_parcel->readInt32();
   int error = android::BAD_VALUE;
   DisplayConfigVariableInfo display_attributes;
-  DisplayPort sdm_disp_port = kPortDefault;
-  int hwc_disp_port = qdutils::DISPLAY_PORT_DEFAULT;
 
   if (dpy > HWC_DISPLAY_VIRTUAL) {
     return android::BAD_VALUE;
@@ -1002,17 +1030,12 @@ android::status_t HWCSession::HandleGetDisplayAttributesForConfig(const android:
   if (hwc_display_[dpy]) {
     error = hwc_display_[dpy]->GetDisplayAttributesForConfig(config, &display_attributes);
     if (error == 0) {
-      hwc_display_[dpy]->GetDisplayPort(&sdm_disp_port);
-
-      SetDisplayPort(sdm_disp_port, &hwc_disp_port);
-
       output_parcel->writeInt32(INT(display_attributes.vsync_period_ns));
       output_parcel->writeInt32(INT(display_attributes.x_pixels));
       output_parcel->writeInt32(INT(display_attributes.y_pixels));
       output_parcel->writeFloat(display_attributes.x_dpi);
       output_parcel->writeFloat(display_attributes.y_dpi);
-      output_parcel->writeInt32(hwc_disp_port);
-      output_parcel->writeInt32(display_attributes.is_yuv);
+      output_parcel->writeInt32(0);  // Panel type, unsupported.
     }
   }
 
@@ -1052,13 +1075,11 @@ android::status_t HWCSession::ConfigureRefreshRate(const android::Parcel *input_
     case qdutils::ENABLE_METADATA_DYN_REFRESH_RATE:
       return hwc_display_[HWC_DISPLAY_PRIMARY]->Perform(
           HWCDisplayPrimary::SET_METADATA_DYN_REFRESH_RATE, true);
-    case qdutils::SET_BINDER_DYN_REFRESH_RATE:
-      {
-        uint32_t refresh_rate = UINT32(input_parcel->readInt32());
-        return hwc_display_[HWC_DISPLAY_PRIMARY]->Perform(
-            HWCDisplayPrimary::SET_BINDER_DYN_REFRESH_RATE,
-            refresh_rate);
-      }
+    case qdutils::SET_BINDER_DYN_REFRESH_RATE: {
+      uint32_t refresh_rate = UINT32(input_parcel->readInt32());
+      return hwc_display_[HWC_DISPLAY_PRIMARY]->Perform(
+          HWCDisplayPrimary::SET_BINDER_DYN_REFRESH_RATE, refresh_rate);
+    }
     default:
       DLOGW("Invalid operation %d", operation);
       return -EINVAL;
@@ -1114,11 +1135,11 @@ android::status_t HWCSession::SetDynamicBWForCamera(const android::Parcel *input
   HWBwModes mode = camera_status > 0 ? kBwCamera : kBwDefault;
 
   // trigger invalidate to apply new bw caps.
-  hwc_procs_->invalidate(hwc_procs_);
+  callbacks_.Refresh(HWC_DISPLAY_PRIMARY);
 
-    error = core_intf_->SetMaxBandwidthMode(mode);
+  error = core_intf_->SetMaxBandwidthMode(mode);
   if (error != kErrorNone) {
-      return -EINVAL;
+    return -EINVAL;
   }
 
   new_bw_mode_ = true;
@@ -1128,7 +1149,7 @@ android::status_t HWCSession::SetDynamicBWForCamera(const android::Parcel *input
 }
 
 android::status_t HWCSession::GetBWTransactionStatus(const android::Parcel *input_parcel,
-                                                     android::Parcel *output_parcel)  {
+                                                     android::Parcel *output_parcel) {
   bool state = true;
 
   if (hwc_display_[HWC_DISPLAY_PRIMARY]) {
@@ -1191,6 +1212,16 @@ android::status_t HWCSession::SetMixerResolution(const android::Parcel *input_pa
   return 0;
 }
 
+android::status_t HWCSession::SetColorModeOverride(const android::Parcel *input_parcel) {
+  auto display = static_cast<hwc2_display_t >(input_parcel->readInt32());
+  auto mode = static_cast<android_color_mode_t>(input_parcel->readInt32());
+  auto device = static_cast<hwc2_device_t *>(this);
+  auto err = CallDisplayFunction(device, display, &HWCDisplay::SetColorMode, mode);
+  if (err != HWC2_ERROR_NONE)
+    return -EINVAL;
+  return 0;
+}
+
 void HWCSession::DynamicDebug(const android::Parcel *input_parcel) {
   int type = input_parcel->readInt32();
   bool enable = (input_parcel->readInt32() > 0);
@@ -1198,35 +1229,35 @@ void HWCSession::DynamicDebug(const android::Parcel *input_parcel) {
   int verbose_level = input_parcel->readInt32();
 
   switch (type) {
-  case qService::IQService::DEBUG_ALL:
-    HWCDebugHandler::DebugAll(enable, verbose_level);
-    break;
+    case qService::IQService::DEBUG_ALL:
+      HWCDebugHandler::DebugAll(enable, verbose_level);
+      break;
 
-  case qService::IQService::DEBUG_MDPCOMP:
-    HWCDebugHandler::DebugStrategy(enable, verbose_level);
-    HWCDebugHandler::DebugCompManager(enable, verbose_level);
-    break;
+    case qService::IQService::DEBUG_MDPCOMP:
+      HWCDebugHandler::DebugStrategy(enable, verbose_level);
+      HWCDebugHandler::DebugCompManager(enable, verbose_level);
+      break;
 
-  case qService::IQService::DEBUG_PIPE_LIFECYCLE:
-    HWCDebugHandler::DebugResources(enable, verbose_level);
-    break;
+    case qService::IQService::DEBUG_PIPE_LIFECYCLE:
+      HWCDebugHandler::DebugResources(enable, verbose_level);
+      break;
 
-  case qService::IQService::DEBUG_DRIVER_CONFIG:
-    HWCDebugHandler::DebugDriverConfig(enable, verbose_level);
-    break;
+    case qService::IQService::DEBUG_DRIVER_CONFIG:
+      HWCDebugHandler::DebugDriverConfig(enable, verbose_level);
+      break;
 
-  case qService::IQService::DEBUG_ROTATOR:
-    HWCDebugHandler::DebugResources(enable, verbose_level);
-    HWCDebugHandler::DebugDriverConfig(enable, verbose_level);
-    HWCDebugHandler::DebugRotator(enable, verbose_level);
-    break;
+    case qService::IQService::DEBUG_ROTATOR:
+      HWCDebugHandler::DebugResources(enable, verbose_level);
+      HWCDebugHandler::DebugDriverConfig(enable, verbose_level);
+      HWCDebugHandler::DebugRotator(enable, verbose_level);
+      break;
 
-  case qService::IQService::DEBUG_QDCM:
-    HWCDebugHandler::DebugQdcm(enable, verbose_level);
-    break;
+    case qService::IQService::DEBUG_QDCM:
+      HWCDebugHandler::DebugQdcm(enable, verbose_level);
+      break;
 
-  default:
-    DLOGW("type = %d is not supported", type);
+    default:
+      DLOGW("type = %d is not supported", type);
   }
 }
 
@@ -1249,12 +1280,12 @@ android::status_t HWCSession::QdcmCMDHandler(const android::Parcel *input_parcel
   ret = HWCColorManager::CreatePayloadFromParcel(*input_parcel, &display_id, &req_payload);
   if (!ret) {
     if (HWC_DISPLAY_PRIMARY == display_id && hwc_display_[HWC_DISPLAY_PRIMARY])
-      ret = hwc_display_[HWC_DISPLAY_PRIMARY]->ColorSVCRequestRoute(req_payload,
-                                                                  &resp_payload, &pending_action);
+      ret = hwc_display_[HWC_DISPLAY_PRIMARY]->ColorSVCRequestRoute(req_payload, &resp_payload,
+                                                                    &pending_action);
 
     if (HWC_DISPLAY_EXTERNAL == display_id && hwc_display_[HWC_DISPLAY_EXTERNAL])
       ret = hwc_display_[HWC_DISPLAY_EXTERNAL]->ColorSVCRequestRoute(req_payload, &resp_payload,
-                                                                  &pending_action);
+                                                                     &pending_action);
   }
 
   if (ret) {
@@ -1266,7 +1297,7 @@ android::status_t HWCSession::QdcmCMDHandler(const android::Parcel *input_parcel
 
   switch (pending_action.action) {
     case kInvalidating:
-      hwc_procs_->invalidate(hwc_procs_);
+      callbacks_.Refresh(HWC_DISPLAY_PRIMARY);
       break;
     case kEnterQDCMMode:
       ret = color_mgr_->EnableQDCMMode(true, hwc_display_[HWC_DISPLAY_PRIMARY]);
@@ -1275,17 +1306,17 @@ android::status_t HWCSession::QdcmCMDHandler(const android::Parcel *input_parcel
       ret = color_mgr_->EnableQDCMMode(false, hwc_display_[HWC_DISPLAY_PRIMARY]);
       break;
     case kApplySolidFill:
-      ret = color_mgr_->SetSolidFill(pending_action.params,
-                                     true, hwc_display_[HWC_DISPLAY_PRIMARY]);
-      hwc_procs_->invalidate(hwc_procs_);
+      ret =
+          color_mgr_->SetSolidFill(pending_action.params, true, hwc_display_[HWC_DISPLAY_PRIMARY]);
+      callbacks_.Refresh(HWC_DISPLAY_PRIMARY);
       break;
     case kDisableSolidFill:
-      ret = color_mgr_->SetSolidFill(pending_action.params,
-                                     false, hwc_display_[HWC_DISPLAY_PRIMARY]);
-      hwc_procs_->invalidate(hwc_procs_);
+      ret =
+          color_mgr_->SetSolidFill(pending_action.params, false, hwc_display_[HWC_DISPLAY_PRIMARY]);
+      callbacks_.Refresh(HWC_DISPLAY_PRIMARY);
       break;
     case kSetPanelBrightness:
-      brightness_value = reinterpret_cast<int32_t*>(resp_payload.payload);
+      brightness_value = reinterpret_cast<int32_t *>(resp_payload.payload);
       if (brightness_value == NULL) {
         DLOGE("Brightness value is Null");
         return -EINVAL;
@@ -1294,13 +1325,13 @@ android::status_t HWCSession::QdcmCMDHandler(const android::Parcel *input_parcel
         ret = hwc_display_[HWC_DISPLAY_PRIMARY]->SetPanelBrightness(*brightness_value);
       break;
     case kEnableFrameCapture:
-      ret = color_mgr_->SetFrameCapture(pending_action.params,
-                                        true, hwc_display_[HWC_DISPLAY_PRIMARY]);
-      hwc_procs_->invalidate(hwc_procs_);
+      ret = color_mgr_->SetFrameCapture(pending_action.params, true,
+                                        hwc_display_[HWC_DISPLAY_PRIMARY]);
+      callbacks_.Refresh(HWC_DISPLAY_PRIMARY);
       break;
     case kDisableFrameCapture:
-      ret = color_mgr_->SetFrameCapture(pending_action.params,
-                                        false, hwc_display_[HWC_DISPLAY_PRIMARY]);
+      ret = color_mgr_->SetFrameCapture(pending_action.params, false,
+                                        hwc_display_[HWC_DISPLAY_PRIMARY]);
       break;
     case kNoAction:
       break;
@@ -1315,7 +1346,7 @@ android::status_t HWCSession::QdcmCMDHandler(const android::Parcel *input_parcel
   req_payload.DestroyPayload();
   resp_payload.DestroyPayload();
 
-  return (ret? -EINVAL : 0);
+  return (ret ? -EINVAL : 0);
 }
 
 android::status_t HWCSession::OnMinHdcpEncryptionLevelChange(const android::Parcel *input_parcel,
@@ -1341,7 +1372,7 @@ android::status_t HWCSession::OnMinHdcpEncryptionLevelChange(const android::Parc
   return ret;
 }
 
-void* HWCSession::HWCUeventThread(void *context) {
+void *HWCSession::HWCUeventThread(void *context) {
   if (context) {
     return reinterpret_cast<HWCSession *>(context)->HWCUeventThreadHandler();
   }
@@ -1349,7 +1380,7 @@ void* HWCSession::HWCUeventThread(void *context) {
   return NULL;
 }
 
-void* HWCSession::HWCUeventThreadHandler() {
+void *HWCSession::HWCUeventThreadHandler() {
   static char uevent_data[PAGE_SIZE];
   int length = 0;
   prctl(PR_SET_NAME, uevent_thread_name_, 0, 0, 0);
@@ -1379,12 +1410,8 @@ void* HWCSession::HWCUeventThreadHandler() {
       DLOGI("Uevent FB0 = %s", uevent_data);
       int panel_reset = GetEventValue(uevent_data, length, "PANEL_ALIVE=");
       if (panel_reset == 0) {
-        if (hwc_procs_) {
-          reset_panel_ = true;
-          hwc_procs_->invalidate(hwc_procs_);
-        } else {
-          DLOGW("Ignore resetpanel - hwc_proc not registered");
-        }
+        callbacks_.Refresh(0);
+        reset_panel_ = true;
       }
     }
   }
@@ -1396,7 +1423,7 @@ void* HWCSession::HWCUeventThreadHandler() {
 int HWCSession::GetEventValue(const char *uevent_data, int length, const char *event_info) {
   const char *iterator_str = uevent_data;
   while (((iterator_str - uevent_data) <= length) && (*iterator_str)) {
-    char *pstr = strstr(iterator_str, event_info);
+    const char *pstr = strstr(iterator_str, event_info);
     if (pstr != NULL) {
       return (atoi(iterator_str + strlen(event_info)));
     }
@@ -1407,23 +1434,23 @@ int HWCSession::GetEventValue(const char *uevent_data, int length, const char *e
 }
 
 void HWCSession::ResetPanel() {
-  int status = -EINVAL;
+  HWC2::Error status;
 
   DLOGI("Powering off primary");
-  status = hwc_display_[HWC_DISPLAY_PRIMARY]->SetPowerMode(HWC_POWER_MODE_OFF);
-  if (status) {
+  status = hwc_display_[HWC_DISPLAY_PRIMARY]->SetPowerMode(HWC2::PowerMode::Off);
+  if (status != HWC2::Error::None) {
     DLOGE("power-off on primary failed with error = %d", status);
   }
 
   DLOGI("Restoring power mode on primary");
-  int32_t mode = INT(hwc_display_[HWC_DISPLAY_PRIMARY]->GetLastPowerMode());
+  HWC2::PowerMode mode = hwc_display_[HWC_DISPLAY_PRIMARY]->GetLastPowerMode();
   status = hwc_display_[HWC_DISPLAY_PRIMARY]->SetPowerMode(mode);
-  if (status) {
+  if (status != HWC2::Error::None) {
     DLOGE("Setting power mode = %d on primary failed with error = %d", mode, status);
   }
 
-  status = hwc_display_[HWC_DISPLAY_PRIMARY]->EventControl(HWC_EVENT_VSYNC, 1);
-  if (status) {
+  status = hwc_display_[HWC_DISPLAY_PRIMARY]->SetVsyncEnabled(HWC2::Vsync::Enable);
+  if (status != HWC2::Error::None) {
     DLOGE("enabling vsync failed for primary with error = %d", status);
   }
 
@@ -1433,7 +1460,7 @@ void HWCSession::ResetPanel() {
 int HWCSession::HotPlugHandler(bool connected) {
   int status = 0;
   bool notify_hotplug = false;
-  bool refresh_screen = false;
+  bool hdmi_primary = false;
 
   // To prevent sending events to client while a lock is held, acquire scope locks only within
   // below scope so that those get automatically unlocked after the scope ends.
@@ -1441,108 +1468,55 @@ int HWCSession::HotPlugHandler(bool connected) {
     SEQUENCE_WAIT_SCOPE_LOCK(locker_);
 
     if (!hwc_display_[HWC_DISPLAY_PRIMARY]) {
-      DLOGE("Primay display is not connected.");
+      DLOGE("Primary display is not connected.");
       return -1;
     }
 
-
     HWCDisplay *primary_display = hwc_display_[HWC_DISPLAY_PRIMARY];
     HWCDisplay *external_display = NULL;
-    HWCDisplay *null_display = NULL;
 
     if (primary_display->GetDisplayClass() == DISPLAY_CLASS_EXTERNAL) {
       external_display = static_cast<HWCDisplayExternal *>(hwc_display_[HWC_DISPLAY_PRIMARY]);
-    } else if (primary_display->GetDisplayClass() == DISPLAY_CLASS_NULL) {
-      null_display = static_cast<HWCDisplayNull *>(hwc_display_[HWC_DISPLAY_PRIMARY]);
+      hdmi_primary = true;
     }
 
     // If primary display connected is a NULL display, then replace it with the external display
     if (connected) {
       // If we are in HDMI as primary and the primary display just got plugged in
-      if (is_hdmi_primary_ && null_display) {
-        uint32_t primary_width, primary_height;
-        null_display->GetFrameBufferResolution(&primary_width, &primary_height);
-        delete null_display;
-        hwc_display_[HWC_DISPLAY_PRIMARY] = NULL;
+      if (hwc_display_[HWC_DISPLAY_EXTERNAL]) {
+        DLOGE("HDMI is already connected");
+        return -1;
+      }
 
-        // Create external display with a forced framebuffer resolution to that of what the NULL
-        // display had. This is necessary because SurfaceFlinger does not dynamically update
-        // framebuffer resolution once it reads it at bootup. So we always have to have the NULL
-        // display/external display both at the bootup resolution.
-        int status = HWCDisplayExternal::Create(core_intf_, &hwc_procs_, primary_width,
-                                                primary_height, qservice_, true,
-                                                &hwc_display_[HWC_DISPLAY_PRIMARY]);
+      // Connect external display if virtual display is not connected.
+      // Else, defer external display connection and process it when virtual display
+      // tears down; Do not notify SurfaceFlinger since connection is deferred now.
+      if (!hwc_display_[HWC_DISPLAY_VIRTUAL]) {
+        status = ConnectDisplay(HWC_DISPLAY_EXTERNAL);
         if (status) {
-          DLOGE("Could not create external display");
-          return -1;
+          return status;
         }
-
-        status = hwc_display_[HWC_DISPLAY_PRIMARY]->SetPowerMode(HWC_POWER_MODE_NORMAL);
-        if (status) {
-          DLOGE("power-on on primary failed with error = %d", status);
-        }
-
-        is_hdmi_yuv_ = IsDisplayYUV(HWC_DISPLAY_PRIMARY);
-
-        // Next, go ahead and enable vsync on external display. This is expliclity required
-        // because in HDMI as primary case, SurfaceFlinger may not be aware of underlying
-        // changing display. and thus may not explicitly enable vsync
-
-        status = hwc_display_[HWC_DISPLAY_PRIMARY]->EventControl(HWC_EVENT_VSYNC, true);
-        if (status) {
-          DLOGE("Error enabling vsync for HDMI as primary case");
-        }
-        // Don't do hotplug notification for HDMI as primary case for now
-        notify_hotplug = false;
-        refresh_screen = true;
+        notify_hotplug = true;
       } else {
-        if (hwc_display_[HWC_DISPLAY_EXTERNAL]) {
-          DLOGE("HDMI is already connected");
-          return -1;
-        }
-
-        // Connect external display if virtual display is not connected.
-        // Else, defer external display connection and process it when virtual display
-        // tears down; Do not notify SurfaceFlinger since connection is deferred now.
-        if (!hwc_display_[HWC_DISPLAY_VIRTUAL]) {
-          status = ConnectDisplay(HWC_DISPLAY_EXTERNAL, NULL);
-          if (status) {
-            return status;
-          }
-          notify_hotplug = true;
-        } else {
-          DLOGI("Virtual display is connected, pending connection");
-          external_pending_connect_ = true;
-        }
+        DLOGI("Virtual display is connected, pending connection");
+        external_pending_connect_ = true;
       }
     } else {
       // Do not return error if external display is not in connected status.
       // Due to virtual display concurrency, external display connection might be still pending
       // but hdmi got disconnected before pending connection could be processed.
 
-      if (is_hdmi_primary_ && external_display) {
+      if (hdmi_primary) {
+        assert(external_display != NULL);
         uint32_t x_res, y_res;
         external_display->GetFrameBufferResolution(&x_res, &y_res);
         // Need to manually disable VSYNC as SF is not aware of connect/disconnect cases
         // for HDMI as primary
-        external_display->EventControl(HWC_EVENT_VSYNC, false);
+        external_display->SetVsyncEnabled(HWC2::Vsync::Disable);
         HWCDisplayExternal::Destroy(external_display);
 
-        HWCDisplayNull *null_display;
-
-        int status = HWCDisplayNull::Create(core_intf_, &hwc_procs_,
-                                            reinterpret_cast<HWCDisplay **>(&null_display));
-
-        if (status) {
-          DLOGE("Could not create Null display when primary got disconnected");
-          return -1;
-        }
-
-        null_display->SetResolution(x_res, y_res);
-        hwc_display_[HWC_DISPLAY_PRIMARY] = null_display;
-
-        // Don't do hotplug notification for HDMI as primary case for now
-        notify_hotplug = false;
+        // In HWC2, primary displays can be hotplugged out
+        notify_hotplug = true;
       } else {
         if (hwc_display_[HWC_DISPLAY_EXTERNAL]) {
           status = DisconnectDisplay(HWC_DISPLAY_EXTERNAL);
@@ -1553,16 +1527,18 @@ int HWCSession::HotPlugHandler(bool connected) {
     }
   }
 
-  if (connected && (notify_hotplug || refresh_screen)) {
+  if (connected && notify_hotplug) {
     // trigger screen refresh to ensure sufficient resources are available to process new
     // new display connection.
-    hwc_procs_->invalidate(hwc_procs_);
+    callbacks_.Refresh(0);
     uint32_t vsync_period = UINT32(GetVsyncPeriod(HWC_DISPLAY_PRIMARY));
     usleep(vsync_period * 2 / 1000);
   }
   // notify client
+  // Handle HDMI as primary here
   if (notify_hotplug) {
-    hwc_procs_->hotplug(hwc_procs_, HWC_DISPLAY_EXTERNAL, connected);
+    callbacks_.Hotplug(HWC_DISPLAY_EXTERNAL,
+                       connected ? HWC2::Connection::Connected : HWC2::Connection::Disconnected);
   }
 
   qservice_->onHdmiHotplug(INT(connected));
@@ -1570,42 +1546,17 @@ int HWCSession::HotPlugHandler(bool connected) {
   return 0;
 }
 
-void HWCSession::HandleSecureDisplaySession(hwc_display_contents_1_t **displays) {
-  secure_display_active_ = false;
-  if (!*displays) {
-    DLOGW("Invalid display contents");
-    return;
+int HWCSession::GetVsyncPeriod(int disp) {
+  SCOPE_LOCK(locker_);
+  // default value
+  int32_t vsync_period = 1000000000l / 60;
+  auto attribute = HWC2::Attribute::VsyncPeriod;
+
+  if (hwc_display_[disp]) {
+    hwc_display_[disp]->GetDisplayAttribute(0, attribute, &vsync_period);
   }
 
-  hwc_display_contents_1_t *content_list = displays[HWC_DISPLAY_PRIMARY];
-  if (!content_list) {
-    DLOGW("Invalid primary content list");
-    return;
-  }
-  size_t num_hw_layers = content_list->numHwLayers;
-
-  for (size_t i = 0; i < num_hw_layers - 1; i++) {
-    hwc_layer_1_t &hwc_layer = content_list->hwLayers[i];
-    const private_handle_t *pvt_handle = static_cast<const private_handle_t *>(hwc_layer.handle);
-    if (pvt_handle && pvt_handle->flags & private_handle_t::PRIV_FLAGS_SECURE_DISPLAY) {
-      secure_display_active_ = true;
-    }
-  }
-
-  // Force flush on primary during transitions(secure<->non secure)
-  // when external displays are connected.
-  bool force_flush = false;
-  if ((connected_displays_[HWC_DISPLAY_PRIMARY] == 1) &&
-     ((connected_displays_[HWC_DISPLAY_EXTERNAL] == 1) ||
-      (connected_displays_[HWC_DISPLAY_VIRTUAL] == 1))) {
-    force_flush = true;
-  }
-
-  for (ssize_t dpy = static_cast<ssize_t>(HWC_NUM_DISPLAY_TYPES - 1); dpy >= 0; dpy--) {
-    if (hwc_display_[dpy]) {
-      hwc_display_[dpy]->SetSecureDisplay(secure_display_active_, force_flush);
-    }
-  }
+  return vsync_period;
 }
 
 android::status_t HWCSession::GetVisibleDisplayRect(const android::Parcel *input_parcel,
@@ -1613,7 +1564,7 @@ android::status_t HWCSession::GetVisibleDisplayRect(const android::Parcel *input
   int dpy = input_parcel->readInt32();
 
   if (dpy < HWC_DISPLAY_PRIMARY || dpy > HWC_DISPLAY_VIRTUAL) {
-    return android::BAD_VALUE;;
+    return android::BAD_VALUE;
   }
 
   if (!hwc_display_[dpy]) {
@@ -1635,4 +1586,3 @@ android::status_t HWCSession::GetVisibleDisplayRect(const android::Parcel *input
 }
 
 }  // namespace sdm
-

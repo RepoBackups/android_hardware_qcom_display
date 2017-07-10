@@ -1,34 +1,31 @@
 /*
-* Copyright (c) 2014 - 2016, The Linux Foundation. All rights reserved.
-*
-* Redistribution and use in source and binary forms, with or without modification, are permitted
-* provided that the following conditions are met:
-*    * Redistributions of source code must retain the above copyright notice, this list of
-*      conditions and the following disclaimer.
-*    * Redistributions in binary form must reproduce the above copyright notice, this list of
-*      conditions and the following disclaimer in the documentation and/or other materials provided
-*      with the distribution.
-*    * Neither the name of The Linux Foundation nor the names of its contributors may be used to
-*      endorse or promote products derived from this software without specific prior written
-*      permission.
-*
-* THIS SOFTWARE IS PROVIDED "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
-* LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
-* NON-INFRINGEMENT ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE
-* FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
-* BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS;
-* OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT,
-* STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-* OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-*/
+ * Copyright (c) 2014-2016, The Linux Foundation. All rights reserved.
+ * Not a Contribution.
+ *
+ * Copyright 2015 The Android Open Source Project
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 
 #ifndef __HWC_SESSION_H__
 #define __HWC_SESSION_H__
 
-#include <hardware/hwcomposer.h>
 #include <core/core_interface.h>
 #include <utils/locker.h>
 
+#include "hwc_callbacks.h"
+#include "hwc_layers.h"
+#include "hwc_display.h"
 #include "hwc_display_primary.h"
 #include "hwc_display_external.h"
 #include "hwc_display_virtual.h"
@@ -36,54 +33,98 @@
 
 namespace sdm {
 
-class HWCSession : hwc_composer_device_1_t, public qClient::BnQClient {
+class HWCSession : hwc2_device_t, public qClient::BnQClient {
  public:
   struct HWCModuleMethods : public hw_module_methods_t {
-    HWCModuleMethods() {
-      hw_module_methods_t::open = HWCSession::Open;
-    }
+    HWCModuleMethods() { hw_module_methods_t::open = HWCSession::Open; }
   };
 
   explicit HWCSession(const hw_module_t *module);
   int Init();
   int Deinit();
+  HWC2::Error CreateVirtualDisplayObject(uint32_t width, uint32_t height, int32_t *format);
+
+  template <typename... Args>
+  static int32_t CallDisplayFunction(hwc2_device_t *device, hwc2_display_t display,
+                                     HWC2::Error (HWCDisplay::*member)(Args...), Args... args) {
+    if (!device) {
+      return HWC2_ERROR_BAD_DISPLAY;
+    }
+
+    HWCSession *hwc_session = static_cast<HWCSession *>(device);
+    auto status = HWC2::Error::BadDisplay;
+    if (hwc_session->hwc_display_[display]) {
+      auto hwc_display = hwc_session->hwc_display_[display];
+      status = (hwc_display->*member)(std::forward<Args>(args)...);
+    }
+    return INT32(status);
+  }
+
+  template <typename... Args>
+  static int32_t CallLayerFunction(hwc2_device_t *device, hwc2_display_t display,
+                                   hwc2_layer_t layer, HWC2::Error (HWCLayer::*member)(Args...),
+                                   Args... args) {
+    if (!device) {
+      return HWC2_ERROR_BAD_DISPLAY;
+    }
+
+    HWCSession *hwc_session = static_cast<HWCSession *>(device);
+    auto status = HWC2::Error::BadDisplay;
+    if (hwc_session->hwc_display_[display]) {
+      status = HWC2::Error::BadLayer;
+      auto hwc_layer = hwc_session->hwc_display_[display]->GetHWCLayer(layer);
+      if (hwc_layer != nullptr) {
+        status = (hwc_layer->*member)(std::forward<Args>(args)...);
+      }
+    }
+    return INT32(status);
+  }
+
+  // HWC2 Functions that require a concrete implementation in hwc session
+  // and hence need to be member functions
+  static int32_t CreateLayer(hwc2_device_t *device, hwc2_display_t display,
+                             hwc2_layer_t *out_layer_id);
+  static int32_t CreateVirtualDisplay(hwc2_device_t *device, uint32_t width, uint32_t height,
+                                      int32_t *format, hwc2_display_t *out_display_id);
+  static int32_t DestroyLayer(hwc2_device_t *device, hwc2_display_t display, hwc2_layer_t layer);
+  static int32_t DestroyVirtualDisplay(hwc2_device_t *device, hwc2_display_t display);
+  static void Dump(hwc2_device_t *device, uint32_t *out_size, char *out_buffer);
+  static int32_t PresentDisplay(hwc2_device_t *device, hwc2_display_t display,
+                                int32_t *out_retire_fence);
+  static int32_t RegisterCallback(hwc2_device_t *device, int32_t descriptor,
+                                  hwc2_callback_data_t callback_data,
+                                  hwc2_function_pointer_t pointer);
+  static int32_t SetOutputBuffer(hwc2_device_t *device, hwc2_display_t display,
+                                 buffer_handle_t buffer, int32_t releaseFence);
+  static int32_t SetLayerZOrder(hwc2_device_t *device, hwc2_display_t display, hwc2_layer_t layer,
+                                uint32_t z);
+  static int32_t SetPowerMode(hwc2_device_t *device, hwc2_display_t display, int32_t int_mode);
+  static int32_t ValidateDisplay(hwc2_device_t *device, hwc2_display_t display,
+                                 uint32_t *out_num_types, uint32_t *out_num_requests);
+  static int32_t SetColorMode(hwc2_device_t *device, hwc2_display_t display,
+                              int32_t /*android_color_mode_t*/ int_mode);
+  static int32_t SetColorTransform(hwc2_device_t *device, hwc2_display_t display,
+                                   const float *matrix, int32_t /*android_color_transform_t*/ hint);
 
  private:
   static const int kExternalConnectionTimeoutMs = 500;
   static const int kPartialUpdateControlTimeoutMs = 100;
 
   // hwc methods
-  static int Open(const hw_module_t *module, const char* name, hw_device_t **device);
+  static int Open(const hw_module_t *module, const char *name, hw_device_t **device);
   static int Close(hw_device_t *device);
-  static int Prepare(hwc_composer_device_1 *device, size_t num_displays,
-                     hwc_display_contents_1_t **displays);
-  static int Set(hwc_composer_device_1 *device, size_t num_displays,
-                 hwc_display_contents_1_t **displays);
-  static int EventControl(hwc_composer_device_1 *device, int disp, int event, int enable);
-  static int SetPowerMode(hwc_composer_device_1 *device, int disp, int mode);
-  static int Query(hwc_composer_device_1 *device, int param, int *value);
-  static void RegisterProcs(hwc_composer_device_1 *device, hwc_procs_t const *procs);
-  static void Dump(hwc_composer_device_1 *device, char *buffer, int length);
-  // These config functions always return FB params, the actual display params may differ.
-  static int GetDisplayConfigs(hwc_composer_device_1 *device, int disp, uint32_t *configs,
-                               size_t *numConfigs);
-  static int GetDisplayAttributes(hwc_composer_device_1 *device, int disp, uint32_t config,
-                                  const uint32_t *display_attributes, int32_t *values);
-  static int GetActiveConfig(hwc_composer_device_1 *device, int disp);
-  static int SetActiveConfig(hwc_composer_device_1 *device, int disp, int index);
-  static int SetCursorPositionAsync(hwc_composer_device_1 *device, int disp, int x, int y);
-  static void CloseAcquireFds(hwc_display_contents_1_t *content_list);
-  bool IsDisplayYUV(int disp);
+  static void GetCapabilities(struct hwc2_device *device, uint32_t *outCount,
+                              int32_t *outCapabilities);
+  static hwc2_function_pointer_t GetFunction(struct hwc2_device *device, int32_t descriptor);
 
   // Uevent thread
-  static void* HWCUeventThread(void *context);
-  void* HWCUeventThreadHandler();
+  static void *HWCUeventThread(void *context);
+  void *HWCUeventThreadHandler();
   int GetEventValue(const char *uevent_data, int length, const char *event_info);
   int HotPlugHandler(bool connected);
   void ResetPanel();
-  int ConnectDisplay(int disp, hwc_display_contents_1_t *content_list);
+  int32_t ConnectDisplay(int disp);
   int DisconnectDisplay(int disp);
-  void HandleSecureDisplaySession(hwc_display_contents_1_t **displays);
   int GetVsyncPeriod(int disp);
 
   // QClient methods
@@ -122,15 +163,15 @@ class HWCSession : hwc_composer_device_1_t, public qClient::BnQClient {
   android::status_t SetDynamicBWForCamera(const android::Parcel *input_parcel,
                                           android::Parcel *output_parcel);
   android::status_t GetBWTransactionStatus(const android::Parcel *input_parcel,
-                                          android::Parcel *output_parcel);
+                                           android::Parcel *output_parcel);
   android::status_t SetMixerResolution(const android::Parcel *input_parcel);
-  android::status_t SetDisplayPort(DisplayPort sdm_disp_port, int *hwc_disp_port);
+
+  android::status_t SetColorModeOverride(const android::Parcel *input_parcel);
 
   static Locker locker_;
   CoreInterface *core_intf_ = NULL;
-  hwc_procs_t hwc_procs_default_;
-  hwc_procs_t const *hwc_procs_ = &hwc_procs_default_;
-  HWCDisplay *hwc_display_[HWC_NUM_DISPLAY_TYPES] = { NULL };
+  HWCDisplay *hwc_display_[HWC_NUM_DISPLAY_TYPES] = {NULL};
+  HWCCallbacks callbacks_;
   pthread_t uevent_thread_;
   bool uevent_thread_exit_ = false;
   const char *uevent_thread_name_ = "HWC_UeventThread";
@@ -144,12 +185,8 @@ class HWCSession : hwc_composer_device_1_t, public qClient::BnQClient {
   bool need_invalidate_ = false;
   int bw_mode_release_fd_ = -1;
   qService::QService *qservice_ = NULL;
-  bool is_hdmi_primary_ = false;
-  bool is_hdmi_yuv_ = false;
-  std::bitset<HWC_NUM_DISPLAY_TYPES> connected_displays_;  // Bit mask of connected displays
 };
 
 }  // namespace sdm
 
 #endif  // __HWC_SESSION_H__
-
